@@ -1,9 +1,6 @@
 #include <SPI.h>
 #include <RF24.h>
 
-// Uncomment to enable Serial debugging
-//#define DEBUG_MODE
-
 RF24 radio(9, 10);  // CE, CSN
 
 const byte broadcastPipe[6] = "BCAST";
@@ -17,10 +14,14 @@ const int GREEN_LED  = 7;
 
 bool listeningToCommandPipe = false;
 
+#define MSG_HISTORY_SIZE 20
+
+// space for 20 two-char IDs + null terminator
+char msgHistory[MSG_HISTORY_SIZE][3];  
+int historyIndex = 0;  // next slot to overwrite
+
 void setup() {
-#ifdef DEBUG_MODE
-  Serial.begin(115200);
-#endif
+
 
   radio.begin();
   radio.setPALevel(RF24_PA_MAX);
@@ -30,9 +31,6 @@ void setup() {
   radio.openReadingPipe(1, broadcastPipe);
   radio.startListening();
 
-#ifdef DEBUG_MODE
-  Serial.print("Slave "); Serial.print(myID); Serial.println(" ready.");
-#endif
 
   pinMode(RED_LED, OUTPUT);
   pinMode(ORANGE_LED, OUTPUT);
@@ -42,73 +40,98 @@ void setup() {
 
 void loop() {
   if (radio.available()) {
-    char msg[32] = {0};
-    radio.read(&msg, sizeof(msg));
-#ifdef DEBUG_MODE
-    Serial.print("Received: "); Serial.println(msg);
-#endif
+	char raw[32] = {0};
+	radio.read(&raw, sizeof(raw));
 
-    if (strcmp(msg, "WHO") == 0 && !listeningToCommandPipe) {
-      radio.stopListening();
+	// Make a working copy, since strtok modifies the buffer
+	char buf[32];
+	strncpy(buf, raw, sizeof(buf));
 
-      int idNumber = atoi(myID);
-      blinkLedFor("ALL", 500 * idNumber, 3);
+	char *msgId    = strtok(buf, "|");
+	char *toField  = strtok(nullptr, "|");
+	char *cmdField = strtok(nullptr, "|");
+  
+    if (!msgId || !toField || !cmdField) {
+		return;
+	}
+	
+	if (seenBefore(msgId)) {
+	  // duplicate of one of the last 20 — ignore
+		return;
+	}
+	// first time seeing this ID → record it
+	recordMsgId(msgId);
+  
+	char *toValue = toField;
+	if (toField && strncmp(toField, "TO:", 3) == 0) {
+		toValue = toField + 3;
+	}
 
-      radio.openWritingPipe(broadcastPipe);
-      radio.write(&myID, sizeof(myID));
-#ifdef DEBUG_MODE
-      Serial.println("Responded to WHO");
-#endif
+	char *cmdValue = cmdField;
+	if (cmdField && strncmp(cmdField, "CMD:", 4) == 0) {
+		cmdValue = cmdField + 4;
+	}
+ 
+// WHO functionality, if 'TO:ALL|CMD:WHO' is received, write device ID to BROADCAST channel then switch to COMMAND channel
+	if ( strcmp(toValue,  "ALL") == 0 && strcmp(cmdValue, "WHO") == 0 && !listeningToCommandPipe){
+		radio.stopListening();
 
-      radio.openReadingPipe(1, commandPipe);
-      radio.startListening();
-      listeningToCommandPipe = true;
-    }
+		int idNumber = atoi(myID);
+		blinkLedFor("ALL", 500 * idNumber, 3);
 
-    else if (strncmp(msg, "TO:ALL", 6) == 0 || strstr(msg, myID)) {
-      char* cmdPtr = strstr(msg, "CMD:");
-      if (cmdPtr) {
-        char* commandText = cmdPtr + 4;
-#ifdef DEBUG_MODE
-        Serial.print("Executing command: ");
-        Serial.println(commandText);
-#endif
+		radio.openWritingPipe(broadcastPipe);
+		radio.write(&myID, sizeof(myID));
 
-        allLedsOff();
+		radio.openReadingPipe(1, commandPipe);
+		radio.startListening();
+		listeningToCommandPipe = true;
+		
+    } else if ( strcmp(toValue, "ALL") == 0 || strcmp(toValue, myID)  == 0) {
+		allLedsOff();
 
-        if (strncmp(commandText, "RESET", strlen("RESET")) == 0) {
-#ifdef DEBUG_MODE
-          Serial.println("Resetting to broadcast mode...");
-#endif
-          radio.stopListening();
-          radio.openReadingPipe(1, broadcastPipe);
-          radio.startListening();
-          listeningToCommandPipe = false;
-          allLedsOff();
-        }
-        else if (strncmp(commandText, "SEQ[", 4) == 0) {
-          handleSequenceCommand(commandText);
-        }
-        else if (commandText[0] == '0') {
-          allLedsOff();
-        }
-        else if (commandText[0] == '1') {
-          digitalWrite(RED_LED, HIGH);
-        }
-        else if (commandText[0] == '2') {
-          digitalWrite(ORANGE_LED, HIGH);
-        }
-        else if (commandText[0] == '3') {
-          digitalWrite(GREEN_LED, HIGH);
-        }
-        else {
-#ifdef DEBUG_MODE
-          Serial.println("Unknown command.");
-#endif
-        }
-      }
+		// RESET → go back to BROADCAST channel and listen
+		if (strcmp(cmdValue, "RESET") == 0) {
+			radio.stopListening();
+			radio.openReadingPipe(1, broadcastPipe);
+			radio.startListening();
+			listeningToCommandPipe = false;
+			allLedsOff();
+		}
+		// SEQ[x,y,z] → timed sequence
+		else if (strncmp(cmdValue, "SEQ[", 4) == 0) {
+			handleSequenceCommand(cmdValue);
+		}
+		// single-digit codes
+		else if (cmdValue[0] == '0') {
+			allLedsOff();
+		}
+		else if (cmdValue[0] == '1') {
+			digitalWrite(RED_LED, HIGH);
+		}
+		else if (cmdValue[0] == '2') {
+			digitalWrite(ORANGE_LED, HIGH);
+		}
+		else if (cmdValue[0] == '3') {
+			digitalWrite(GREEN_LED, HIGH);
+		}
+	}
+}
+
+bool seenBefore(const char *id) {
+  for (int i = 0; i < MSG_HISTORY_SIZE; i++) {
+    if (strcmp(msgHistory[i], id) == 0) {
+      return true;
     }
   }
+  return false;
+}
+
+void recordMsgId(const char *id) {
+  // copy two chars + null
+  strncpy(msgHistory[historyIndex], id, 2);
+  msgHistory[historyIndex][2] = '\0';
+
+  historyIndex = (historyIndex + 1) % MSG_HISTORY_SIZE;
 }
 
 void allLedsOff() {
@@ -129,9 +152,6 @@ void blinkLedFor(const char* color, uint16_t durationMs, uint8_t blinkCount) {
       digitalWrite(ORANGE_LED, HIGH);
       digitalWrite(GREEN_LED, HIGH);
     } else {
-#ifdef DEBUG_MODE
-      Serial.print("Unknown color: "); Serial.println(color);
-#endif
       return;
     }
 
@@ -146,12 +166,6 @@ void handleSequenceCommand(const char* commandText) {
   int parsed = sscanf(commandText, "SEQ[%f,%f,%f]", &redTime, &orangeTime, &greenTime);
 
   if (parsed == 3) {
-#ifdef DEBUG_MODE
-    Serial.print("SEQ parsed - RED: "); Serial.print(redTime);
-    Serial.print(" ORANGE: "); Serial.print(orangeTime);
-    Serial.print(" GREEN: "); Serial.println(greenTime);
-#endif
-
     digitalWrite(RED_LED, HIGH);
     delay((unsigned long)(redTime * 1000));
     allLedsOff();
@@ -163,9 +177,5 @@ void handleSequenceCommand(const char* commandText) {
     digitalWrite(GREEN_LED, HIGH);
     delay((unsigned long)(greenTime * 1000));
     allLedsOff();
-  } else {
-#ifdef DEBUG_MODE
-    Serial.println("SEQ command format invalid.");
-#endif
-  }
+  } 
 }
