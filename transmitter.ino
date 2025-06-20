@@ -1,20 +1,22 @@
 #include <SPI.h>
 #include <RF24.h>
 
-#define DEBUG_MODE
-
 // ─── GLOBALS ────────────────────────────────────────────────────────────
 RF24    radio(9, 10);                // CE, CSN
 const byte broadcastPipe[6] = "BCAST";
 const byte commandPipe  [6] = "CMDCH";
 
 const int MAX_DEVICES = 99;
-char        discoveredIDs[MAX_DEVICES][6];
-int         deviceCount = 0;
+char  discoveredIDs[MAX_DEVICES][6];
+int   deviceCount = 0;
 
+// ─── MESSAGE ID COUNTER ─────────────────────────────────────────────────
+uint8_t nextMsgId = 0;  // will roll 0→99
 
 // ─── FORWARD DECLARATIONS ───────────────────────────────────────────────
 void performDiscovery();
+void buildCommandMessage(char *outBuf, size_t bufSize, const char *target, const char *cmd);
+void sendWithId(const char *baseMsg);
 
 // ─── SETUP ──────────────────────────────────────────────────────────────
 void setup() {
@@ -26,7 +28,6 @@ void setup() {
   radio.setPALevel(RF24_PA_MAX);
   radio.setDataRate(RF24_250KBPS);
   radio.enableDynamicPayloads();
-
 }
 
 // ─── MAIN LOOP ──────────────────────────────────────────────────────────
@@ -34,19 +35,21 @@ void loop() {
   static char buf[64];
   static size_t idx = 0;
 
+// command supported:
+// - devices
+// - broadcast
+// - <device id> <cmd>
+// 		commands can be 0,1,2,3,RESET,WHO,SEQ[r,o,g]
   // Read one line from Serial into buf[]
   while (Serial.available()) {
     char c = Serial.read();
+    if (c == '\r') continue;
 
-    if (c == '\r') {
-      continue;
-    }
     if (c == '\n' || idx >= sizeof(buf) - 1) {
       buf[idx] = '\0';
       idx = 0;
 
-
-      // === handle “devices” command ===
+      // — List devices —
       if (strcasecmp(buf, "devices") == 0) {
         if (deviceCount == 0) {
           Serial.println("None Registered");
@@ -57,167 +60,120 @@ void loop() {
           }
         }
       }
+      // — Broadcast color test —
       else if (strcasecmp(buf, "broadcast") == 0) {
         broadcastColorSequence();
         Serial.println("Broadcast sequence complete.");
       }
-      // === handle “<ID> <CMD>” ===
+      // — <ID> <CMD> path —
       else {
         char target[16] = {0};
         char cmd[32]    = {0};
+
         if (sscanf(buf, "%15s %31s", target, cmd) == 2) {
-          char message[64];
-          snprintf(message, sizeof(message), "TO:%s|CMD:%s", target, cmd);
+          // build the TO:…|CMD:… part
+          char baseMsg[64];
+          buildCommandMessage(baseMsg, sizeof(baseMsg), target, cmd);
 
           Serial.print("Command Sent: ");
-          Serial.println(message);
+          Serial.println(baseMsg);
 
+          // select pipe & send with ID + 3× retry
           radio.openWritingPipe(commandPipe);
-
           radio.stopListening();
-          radio.write(message, strlen(message) + 1, false);
+          sendWithId(baseMsg);
 
-          radio.txStandBy(); 
           Serial.println("OK");
 
           if (strcasecmp(cmd, "RESET") == 0) {
             delay(200);
             performDiscovery();
           }
-        } else {
+        }
+        else {
           Serial.println("❌ Invalid input. Use: <ID> <CMD>");
         }
       }
-    } else {
+    }
+    else {
       buf[idx++] = c;
     }
   }
 }
 
+// ─── FORMAT HELPERS ─────────────────────────────────────────────────────
+
+// Builds "TO:<target>|CMD:<cmd>"
+void buildCommandMessage(char *outBuf, size_t bufSize, const char *target, const char *cmd) {
+  snprintf(outBuf, bufSize, "TO:%s|CMD:%s", target, cmd);
+}
+
+// Prepends a 2-digit ID + '|' then sends 3× with a small delay
+void sendWithId(const char *baseMsg) {
+  // next ID (01–99, then 00)
+  nextMsgId = (nextMsgId + 1) % 100;
+
+  char fullMsg[80];
+  char idStr[3];
+  snprintf(idStr, sizeof(idStr), "%02u", nextMsgId);
+  snprintf(fullMsg, sizeof(fullMsg), "%s|%s", idStr, baseMsg);
+
+  for (int i = 0; i < 3; i++) {
+    radio.write(fullMsg, strlen(fullMsg) + 1, false);
+    radio.txStandBy();
+    delay(5);    // slight gap between repeats
+  }
+}
+
 // ─── BROADCAST COLOR SEQUENCE ────────────────────────────────────────────
 void broadcastColorSequence() {
-  // 1) Switch to broadcast pipe & TX mode
   radio.openWritingPipe(commandPipe);
   radio.stopListening();
 
-  // Temporarily disable retries for “fire-and-forget”
-  radio.setRetries(5, 15);
+  // Temporarily keep retries at your usual settings
+  radio.setRetries(1, 1);
 
   const char *target = "ALL";
-  char message[64];
+  char baseMsg[64];
 
-  for (int cycle = 0; cycle < 3; cycle++) {
-  // GREEN_ON (cmd="3")
-  {
-    const char *cmd = "3";
-    snprintf(message, sizeof(message), "TO:%s|CMD:%s", target, cmd);
-    for (int rep = 0; rep < 3; rep++) {
-      radio.write(message, strlen(message) + 1, true);
-      #ifdef DEBUG_MODE
-        Serial.print("→ BROADCAST: "); Serial.println(message);
-      #endif
-      radio.txStandBy();
-      delay(5);
-    }
+  auto cycleCmd = [&](const char *cmd) {
+    buildCommandMessage(baseMsg, sizeof(baseMsg), target, cmd);
+    sendWithId(baseMsg);
     delay(500);
-  }
+  };
 
-  // ORANGE_ON (cmd="2")
-  {
-    const char *cmd = "2";
-    snprintf(message, sizeof(message), "TO:%s|CMD:%s", target, cmd);
-    for (int rep = 0; rep < 3; rep++) {
-      radio.write(message, strlen(message) + 1, true);
-      #ifdef DEBUG_MODE
-        Serial.print("→ BROADCAST: "); Serial.println(message);
-      #endif
-      radio.txStandBy();
-      delay(5);
-    }
-    delay(500);
-  }
+  // 3× green, orange, red, back to orange, green, then off
+  for (int i = 0; i < 3; i++) cycleCmd("3");
+  for (int i = 0; i < 3; i++) cycleCmd("2");
+  for (int i = 0; i < 3; i++) cycleCmd("1");
+  for (int i = 0; i < 3; i++) cycleCmd("2");
+  for (int i = 0; i < 3; i++) cycleCmd("3");
+  cycleCmd("0");
 
-  // RED_ON (cmd="1")
-  {
-    const char *cmd = "1";
-    snprintf(message, sizeof(message), "TO:%s|CMD:%s", target, cmd);
-    for (int rep = 0; rep < 3; rep++) {
-      radio.write(message, strlen(message) + 1, true);
-      #ifdef DEBUG_MODE
-        Serial.print("→ BROADCAST: "); Serial.println(message);
-      #endif
-      radio.txStandBy();
-      delay(5);
-    }
-    delay(500);
-  }
-
-    // ORANGE_ON (cmd="2")
-  {
-    const char *cmd = "2";
-    snprintf(message, sizeof(message), "TO:%s|CMD:%s", target, cmd);
-    for (int rep = 0; rep < 3; rep++) {
-      radio.write(message, strlen(message) + 1, true);
-      #ifdef DEBUG_MODE
-        Serial.print("→ BROADCAST: "); Serial.println(message);
-      #endif
-      radio.txStandBy();
-      delay(5);
-    }
-    delay(500);
-  }
-}
-
-  // GREEN_ON (cmd="3")
-  {
-    const char *cmd = "3";
-    snprintf(message, sizeof(message), "TO:%s|CMD:%s", target, cmd);
-    for (int rep = 0; rep < 3; rep++) {
-      radio.write(message, strlen(message) + 1, true);
-      #ifdef DEBUG_MODE
-        Serial.print("→ BROADCAST: "); Serial.println(message);
-      #endif
-      radio.txStandBy();
-      delay(5);
-    }
-    delay(500);
-  }
-  
-  const char *cmd = "0";
-  snprintf(message, sizeof(message), "TO:%s|CMD:%s", target, cmd);
-  for (int rep = 0; rep < 3; rep++) {
-    radio.write(message, strlen(message) + 1, true);
-    #ifdef DEBUG_MODE
-      Serial.print("→ BROADCAST: "); Serial.println(message);
-    #endif
-    radio.txStandBy();
-    delay(5);
-  }
-    
-  radio.txStandBy();
-  // Restore your reliable‐transmit defaults for future ACK’d commands
+  // Restore defaults if you need to ACK subsequent commands
   radio.setRetries(5, 15);
-
-  // (Optionally) switch back to listening mode if needed:
-  // radio.openReadingPipe(1, broadcastPipe);
-  // radio.startListening();
 }
-
 
 // ─── DISCOVERY ROUTINE ──────────────────────────────────────────────────
 void performDiscovery() {
+  // switch to broadcast pipe & go to TX mode
   radio.openWritingPipe(broadcastPipe);
   radio.stopListening();
-  const char whoMsg[] = "WHO";
-  radio.write(&whoMsg, sizeof(whoMsg), true);
-  #ifdef DEBUG_MODE
-    Serial.println("→ RADIO SENT");
-  #endif
-  radio.txStandBy(); 
+
+  // build "TO:ALL|WHO"
+  char baseMsg[64];
+  buildCommandMessage(baseMsg, sizeof(baseMsg), "ALL", "WHO");
+
+  // send with ID prefix and 3× repeats
+  sendWithId(baseMsg);
+
+  radio.txStandBy();
   Serial.println("OK");
 
+  // give radios a moment before listening
   delay(10);
 
+  // listen for replies
   radio.openReadingPipe(1, broadcastPipe);
   radio.startListening();
 
@@ -243,6 +199,7 @@ void performDiscovery() {
       }
     }
   }
+
   radio.stopListening();
   Serial.println("Discovery complete.");
 }
