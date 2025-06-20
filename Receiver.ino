@@ -7,7 +7,7 @@ RF24 radio(9, 10);               // CE, CSN
 
 const byte broadcastPipe[6] = "BCAST";
 const byte commandPipe[6]   = "CMDCH";
-const char  myID[]          = "02";  // 🟡 Numeric-only ID
+const char  myID[]          = "01";  // 🟡 Numeric-only ID
 
 // LED pins
 const int RED_LED    = 5;
@@ -49,6 +49,13 @@ void setup() {
   pinMode(RED_LED,    OUTPUT);
   pinMode(ORANGE_LED, OUTPUT);
   pinMode(GREEN_LED,  OUTPUT);
+  allLedsOff();
+  
+  delay(500);
+  digitalWrite(RED_LED, HIGH);
+  digitalWrite(ORANGE_LED, HIGH);
+  digitalWrite(GREEN_LED, HIGH);
+  delay(200);
   allLedsOff();
 }
 
