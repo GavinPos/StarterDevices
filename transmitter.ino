@@ -35,6 +35,11 @@ void loop() {
   static char buf[64];
   static size_t idx = 0;
 
+// command supported:
+// - devices
+// - broadcast
+// - <device id> <cmd>
+// 		commands can be 0,1,2,3,RESET,WHO,SEQ[r,o,g]
   // Read one line from Serial into buf[]
   while (Serial.available()) {
     char c = Serial.read();
