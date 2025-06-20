@@ -1,11 +1,13 @@
 #include <SPI.h>
 #include <RF24.h>
+#include <string.h>    // for strtok, strcmp, strncpy, etc.
 
-RF24 radio(9, 10);  // CE, CSN
+// ─── GLOBALS ────────────────────────────────────────────────────────────
+RF24 radio(9, 10);               // CE, CSN
 
 const byte broadcastPipe[6] = "BCAST";
 const byte commandPipe[6]   = "CMDCH";
-const char myID[] = "02";  // 🟡 Numeric-only ID
+const char  myID[]          = "02";  // 🟡 Numeric-only ID
 
 // LED pins
 const int RED_LED    = 5;
@@ -15,108 +17,130 @@ const int GREEN_LED  = 7;
 bool listeningToCommandPipe = false;
 
 #define MSG_HISTORY_SIZE 20
+char msgHistory[MSG_HISTORY_SIZE][3];  // 20 slots of "XY\0"
+int  historyIndex = 0;                 // next slot to overwrite
 
-// space for 20 two-char IDs + null terminator
-char msgHistory[MSG_HISTORY_SIZE][3];  
-int historyIndex = 0;  // next slot to overwrite
+// ─── FORWARD DECLARATIONS ───────────────────────────────────────────────
+bool seenBefore(const char *id);
+void recordMsgId(const char *id);
+void allLedsOff();
+void blinkLedFor(const char* color, uint16_t durationMs, uint8_t blinkCount);
+void handleSequenceCommand(const char* cmdText);
 
+// ─── SETUP ──────────────────────────────────────────────────────────────
 void setup() {
+  Serial.begin(115200);
+  delay(500);
 
+  // zero-clear our history buffer
+  memset(msgHistory, 0, sizeof(msgHistory));
 
+  // Radio init
   radio.begin();
   radio.setPALevel(RF24_PA_MAX);
   radio.setDataRate(RF24_250KBPS);
   radio.enableDynamicPayloads();
 
+  // Start out listening on the discovery pipe
   radio.openReadingPipe(1, broadcastPipe);
   radio.startListening();
 
-
-  pinMode(RED_LED, OUTPUT);
+  // LED pins
+  pinMode(RED_LED,    OUTPUT);
   pinMode(ORANGE_LED, OUTPUT);
-  pinMode(GREEN_LED, OUTPUT);
+  pinMode(GREEN_LED,  OUTPUT);
   allLedsOff();
 }
 
+// ─── MAIN LOOP ──────────────────────────────────────────────────────────
 void loop() {
-  if (radio.available()) {
-	char raw[32] = {0};
-	radio.read(&raw, sizeof(raw));
+  if (!radio.available()) {
+    return;
+  }
 
-	// Make a working copy, since strtok modifies the buffer
-	char buf[32];
-	strncpy(buf, raw, sizeof(buf));
+  char raw[32] = {0};
+  radio.read(raw, sizeof(raw));
 
-	char *msgId    = strtok(buf, "|");
-	char *toField  = strtok(nullptr, "|");
-	char *cmdField = strtok(nullptr, "|");
-  
-    if (!msgId || !toField || !cmdField) {
-		return;
-	}
-	
-	if (seenBefore(msgId)) {
-	  // duplicate of one of the last 20 — ignore
-		return;
-	}
-	// first time seeing this ID → record it
-	recordMsgId(msgId);
-  
-	char *toValue = toField;
-	if (toField && strncmp(toField, "TO:", 3) == 0) {
-		toValue = toField + 3;
-	}
+  // Copy to a buffer we can strtok()
+  char buf[32];
+  strncpy(buf, raw, sizeof(buf));
+  buf[sizeof(buf)-1] = '\0';
 
-	char *cmdValue = cmdField;
-	if (cmdField && strncmp(cmdField, "CMD:", 4) == 0) {
-		cmdValue = cmdField + 4;
-	}
- 
-// WHO functionality, if 'TO:ALL|CMD:WHO' is received, write device ID to BROADCAST channel then switch to COMMAND channel
-	if ( strcmp(toValue,  "ALL") == 0 && strcmp(cmdValue, "WHO") == 0 && !listeningToCommandPipe){
-		radio.stopListening();
+  // Parse "ID|TO:xxx|CMD:yyy"
+  char *msgId    = strtok(buf, "|");
+  char *toField  = strtok(nullptr, "|");
+  char *cmdField = strtok(nullptr, "|");
 
-		int idNumber = atoi(myID);
-		blinkLedFor("ALL", 500 * idNumber, 3);
+  if (!msgId || !toField || !cmdField) {
+    // malformed packet → skip
+    return;
+  }
 
-		radio.openWritingPipe(broadcastPipe);
-		radio.write(&myID, sizeof(myID));
+  // duplicate ID? skip
+  if (seenBefore(msgId)) {
+    return;
+  }
+  recordMsgId(msgId);
 
-		radio.openReadingPipe(1, commandPipe);
-		radio.startListening();
-		listeningToCommandPipe = true;
-		
-    } else if ( strcmp(toValue, "ALL") == 0 || strcmp(toValue, myID)  == 0) {
-		allLedsOff();
+  // strip prefixes
+  char *toValue  = (strncmp(toField,  "TO:",  3) == 0) ? toField  + 3 : toField;
+  char *cmdValue = (strncmp(cmdField, "CMD:", 4) == 0) ? cmdField + 4 : cmdField;
 
-		// RESET → go back to BROADCAST channel and listen
-		if (strcmp(cmdValue, "RESET") == 0) {
-			radio.stopListening();
-			radio.openReadingPipe(1, broadcastPipe);
-			radio.startListening();
-			listeningToCommandPipe = false;
-			allLedsOff();
-		}
-		// SEQ[x,y,z] → timed sequence
-		else if (strncmp(cmdValue, "SEQ[", 4) == 0) {
-			handleSequenceCommand(cmdValue);
-		}
-		// single-digit codes
-		else if (cmdValue[0] == '0') {
-			allLedsOff();
-		}
-		else if (cmdValue[0] == '1') {
-			digitalWrite(RED_LED, HIGH);
-		}
-		else if (cmdValue[0] == '2') {
-			digitalWrite(ORANGE_LED, HIGH);
-		}
-		else if (cmdValue[0] == '3') {
-			digitalWrite(GREEN_LED, HIGH);
-		}
-	}
+  // — WHO handler —
+  if ( strcmp(toValue,  "ALL") == 0
+    && strcmp(cmdValue, "WHO") == 0
+    && !listeningToCommandPipe)
+  {
+    // blink all LEDs to show we're alive
+    int idNum = atoi(myID);
+    blinkLedFor("ALL", 500 * idNum, 3);
+
+    // reply on the broadcast pipe with our ID
+    radio.stopListening();
+    radio.openWritingPipe(broadcastPipe);
+    radio.write(myID, strlen(myID) + 1);
+    radio.txStandBy();
+
+    // now switch to command channel
+    radio.openReadingPipe(1, commandPipe);
+    radio.startListening();
+    listeningToCommandPipe = true;
+    return;
+  }
+
+  // — Commands for us (or broadcast) —
+  if ( strcmp(toValue, "ALL") == 0
+    || strcmp(toValue, myID) == 0 )
+  {
+    allLedsOff();
+
+    if (strcmp(cmdValue, "RESET") == 0) {
+      // go back to listening on broadcast
+      radio.stopListening();
+      radio.openReadingPipe(1, broadcastPipe);
+      radio.startListening();
+      listeningToCommandPipe = false;
+      allLedsOff();
+    }
+    else if (strncmp(cmdValue, "SEQ[", 4) == 0) {
+      handleSequenceCommand(cmdValue);
+    }
+    else if (cmdValue[0] == '0') {
+      allLedsOff();
+    }
+    else if (cmdValue[0] == '1') {
+      digitalWrite(RED_LED, HIGH);
+    }
+    else if (cmdValue[0] == '2') {
+      digitalWrite(ORANGE_LED, HIGH);
+    }
+    else if (cmdValue[0] == '3') {
+      digitalWrite(GREEN_LED, HIGH);
+    }
+  }
 }
 
+// ─── MESSAGE HISTORY ────────────────────────────────────────────────────
 bool seenBefore(const char *id) {
   for (int i = 0; i < MSG_HISTORY_SIZE; i++) {
     if (strcmp(msgHistory[i], id) == 0) {
@@ -127,55 +151,51 @@ bool seenBefore(const char *id) {
 }
 
 void recordMsgId(const char *id) {
-  // copy two chars + null
+  // store the two-char ID + nul
   strncpy(msgHistory[historyIndex], id, 2);
   msgHistory[historyIndex][2] = '\0';
-
   historyIndex = (historyIndex + 1) % MSG_HISTORY_SIZE;
 }
 
+// ─── LED HELPERS ─────────────────────────────────────────────────────────
 void allLedsOff() {
-  digitalWrite(RED_LED, LOW);
+  digitalWrite(RED_LED,    LOW);
   digitalWrite(ORANGE_LED, LOW);
-  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(GREEN_LED,  LOW);
 }
 
 void blinkLedFor(const char* color, uint16_t durationMs, uint8_t blinkCount) {
   if (blinkCount == 0) return;
-  uint16_t segment = durationMs / (blinkCount * 2);
+  uint16_t halfPeriod = durationMs / (blinkCount * 2);
   for (uint8_t i = 0; i < blinkCount; i++) {
-    if (strcmp(color, "RED") == 0) digitalWrite(RED_LED, HIGH);
+    if      (strcmp(color, "RED")    == 0) digitalWrite(RED_LED,    HIGH);
     else if (strcmp(color, "ORANGE") == 0) digitalWrite(ORANGE_LED, HIGH);
-    else if (strcmp(color, "GREEN") == 0) digitalWrite(GREEN_LED, HIGH);
-    else if (strcmp(color, "ALL") == 0) {
+    else if (strcmp(color, "GREEN")  == 0) digitalWrite(GREEN_LED,  HIGH);
+    else if (strcmp(color, "ALL")    == 0) {
       digitalWrite(RED_LED, HIGH);
       digitalWrite(ORANGE_LED, HIGH);
       digitalWrite(GREEN_LED, HIGH);
-    } else {
-      return;
     }
-
-    delay(segment);
+    delay(halfPeriod);
     allLedsOff();
-    delay(segment);
+    delay(halfPeriod);
   }
 }
 
+// ─── SEQUENCE PARSER ─────────────────────────────────────────────────────
 void handleSequenceCommand(const char* commandText) {
-  float redTime = 0, orangeTime = 0, greenTime = 0;
-  int parsed = sscanf(commandText, "SEQ[%f,%f,%f]", &redTime, &orangeTime, &greenTime);
-
-  if (parsed == 3) {
+  float tR, tO, tG;
+  if (sscanf(commandText, "SEQ[%f,%f,%f]", &tR, &tO, &tG) == 3) {
     digitalWrite(RED_LED, HIGH);
-    delay((unsigned long)(redTime * 1000));
+    delay((unsigned long)(tR * 1000));
     allLedsOff();
 
     digitalWrite(ORANGE_LED, HIGH);
-    delay((unsigned long)(orangeTime * 1000));
+    delay((unsigned long)(tO * 1000));
     allLedsOff();
 
     digitalWrite(GREEN_LED, HIGH);
-    delay((unsigned long)(greenTime * 1000));
+    delay((unsigned long)(tG * 1000));
     allLedsOff();
-  } 
+  }
 }
