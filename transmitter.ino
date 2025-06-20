@@ -120,6 +120,8 @@ void sendWithId(const char *baseMsg) {
 
   for (int i = 0; i < 3; i++) {
     radio.write(fullMsg, strlen(fullMsg) + 1, false);
+    //Serial.print("Full Command Sent: ");
+    //Serial.println(fullMsg);
     radio.txStandBy();
     delay(5);    // slight gap between repeats
   }
@@ -143,11 +145,11 @@ void broadcastColorSequence() {
   };
 
   // 3× green, orange, red, back to orange, green, then off
-  for (int i = 0; i < 3; i++) cycleCmd("3");
-  for (int i = 0; i < 3; i++) cycleCmd("2");
-  for (int i = 0; i < 3; i++) cycleCmd("1");
-  for (int i = 0; i < 3; i++) cycleCmd("2");
-  for (int i = 0; i < 3; i++) cycleCmd("3");
+  cycleCmd("3");
+  cycleCmd("2");
+  cycleCmd("1");
+  cycleCmd("2");
+  cycleCmd("3");
   cycleCmd("0");
 
   // Restore defaults if you need to ACK subsequent commands
