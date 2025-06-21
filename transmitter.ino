@@ -39,7 +39,7 @@ void loop() {
 // - devices
 // - broadcast
 // - <device id> <cmd>
-// 		commands can be 0,1,2,3,RESET,WHO,SEQ[r,o,g]
+//     commands can be 0,1,2,3,RESET,WHO,SEQ[r,o,g]
   // Read one line from Serial into buf[]
   while (Serial.available()) {
     char c = Serial.read();
@@ -120,8 +120,8 @@ void sendWithId(const char *baseMsg) {
 
   for (int i = 0; i < 3; i++) {
     radio.write(fullMsg, strlen(fullMsg) + 1, false);
-    //Serial.print("Full Command Sent: ");
-    //Serial.println(fullMsg);
+    Serial.print("Full Command Sent: ");
+    Serial.println(fullMsg);
     radio.txStandBy();
     delay(5);    // slight gap between repeats
   }
