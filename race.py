@@ -5,9 +5,9 @@ import serial
 import serial.tools.list_ports
 import socket
 
-CSV_PATH = "athletes.csv"
-CSV_PATH2= "athletes2.csv"
-SESSION_FILE = "sessions.csv"
+CSV_PATH = "data/athletes.csv"
+CSV_PATH2= "data/athletes2.csv"
+SESSION_FILE = "data/sessions.csv"
 SERIAL_PORT = None
 BAUD_RATE = 115200
 SERIAL_TIMEOUT = 1
@@ -42,8 +42,12 @@ def init_serial():
             timeout=SERIAL_TIMEOUT,
             write_timeout=WRITE_TIMEOUT
         )
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
+        if ser and ser.is_open:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        else:
+            init_serial()
+
         time.sleep(2)   # give Arduino time after reset
 
 def test_all_devices():
@@ -451,12 +455,22 @@ def start_race_sequence(racers):
         if delay>0: time.sleep(delay)
         ser.write(f"{dev} {cmd}\n".encode())
         print(f"{time.time()-t0:>6.2f}s: {dev} {cmd}")
-        if cmd=='3' and not launched:
-            with socket.create_connection(("127.0.0.1",6000)) as sock:
-                sock.sendall(b"s")
-            print(f"{time.time()-t0:>6.2f}s: ⏰ timer started")
-            launched=True
-    input("\nAll commands sent. Press ENTER to continue...")
+        if cmd == '3' and not launched:
+            send_start_command()
+            launched = True
+ 
+ 
+def send_start_command(host="127.0.0.1", port=6000, payload=b"s"):
+    for attempt in range(1, 6):
+        try:
+            with socket.create_connection((host, port), timeout=0.2) as sock:
+                sock.sendall(payload)
+            print(f"✅ Sent “{payload!r}” on attempt {attempt}")
+            return
+        except Exception as e:
+            print(f"⚠️  Start‐cmd attempt {attempt} failed: {e}")
+            time.sleep(0.05)
+    print("❌ Giving up on starting timer!")
 
 
 def show_device_schedule(racers):
