@@ -15,8 +15,7 @@ uint8_t nextMsgId = 0;  // will roll 0→99
 
 // ─── FORWARD DECLARATIONS ───────────────────────────────────────────────
 void performDiscovery();
-void buildCommandMessage(char *outBuf, size_t bufSize, const char *target, const char *cmd);
-void sendWithId(const char *baseMsg);
+void sendCommand(const char *target, const char *cmd);
 
 // ─── SETUP ──────────────────────────────────────────────────────────────
 void setup() {
@@ -35,11 +34,6 @@ void loop() {
   static char buf[64];
   static size_t idx = 0;
 
-// command supported:
-// - devices
-// - broadcast
-// - <device id> <cmd>
-//     commands can be 0,1,2,3,RESET,WHO,SEQ[r,o,g]
   // Read one line from Serial into buf[]
   while (Serial.available()) {
     char c = Serial.read();
@@ -71,17 +65,11 @@ void loop() {
         char cmd[32]    = {0};
 
         if (sscanf(buf, "%15s %31s", target, cmd) == 2) {
-          // build the TO:…|CMD:… part
-          char baseMsg[64];
-          buildCommandMessage(baseMsg, sizeof(baseMsg), target, cmd);
-
           Serial.print("Command Sent: ");
-          Serial.println(baseMsg);
-
-          // select pipe & send with ID + 3× retry
+          // open the command pipe and send
           radio.openWritingPipe(commandPipe);
           radio.stopListening();
-          sendWithId(baseMsg);
+          sendCommand(target, cmd);
 
           Serial.println("OK");
 
@@ -101,29 +89,25 @@ void loop() {
   }
 }
 
-// ─── FORMAT HELPERS ─────────────────────────────────────────────────────
-
-// Builds "TO:<target>|CMD:<cmd>"
-void buildCommandMessage(char *outBuf, size_t bufSize, const char *target, const char *cmd) {
-  snprintf(outBuf, bufSize, "TO:%s|CMD:%s", target, cmd);
-}
-
-// Prepends a 2-digit ID + '|' then sends 3× with a small delay
-void sendWithId(const char *baseMsg) {
+// ─── SINGLE SENDER ──────────────────────────────────────────────────────
+// Builds "TO:<target>|CMD:<cmd>", prepends a rolling 2-digit ID, and
+// sends it 3× with short retries.
+void sendCommand(const char *target, const char *cmd) {
   // next ID (01–99, then 00)
   nextMsgId = (nextMsgId + 1) % 100;
 
   char fullMsg[80];
   char idStr[3];
   snprintf(idStr, sizeof(idStr), "%02u", nextMsgId);
-  snprintf(fullMsg, sizeof(fullMsg), "%s|%s", idStr, baseMsg);
+  snprintf(fullMsg, sizeof(fullMsg),
+           "%s|TO:%s|CMD:%s", idStr, target, cmd);
 
   for (int i = 0; i < 3; i++) {
     radio.write(fullMsg, strlen(fullMsg) + 1, false);
     Serial.print("Full Command Sent: ");
     Serial.println(fullMsg);
     radio.txStandBy();
-    delay(5);    // slight gap between repeats
+    delay(5);
   }
 }
 
@@ -135,12 +119,8 @@ void broadcastColorSequence() {
   // Temporarily keep retries at your usual settings
   radio.setRetries(1, 1);
 
-  const char *target = "ALL";
-  char baseMsg[64];
-
-  auto cycleCmd = [&](const char *cmd) {
-    buildCommandMessage(baseMsg, sizeof(baseMsg), target, cmd);
-    sendWithId(baseMsg);
+  auto cycleCmd = [&](const char *c) {
+    sendCommand("ALL", c);
     delay(500);
   };
 
@@ -152,30 +132,21 @@ void broadcastColorSequence() {
   cycleCmd("3");
   cycleCmd("0");
 
-  // Restore defaults if you need to ACK subsequent commands
+  // Restore defaults for ACKs
   radio.setRetries(5, 15);
 }
 
 // ─── DISCOVERY ROUTINE ──────────────────────────────────────────────────
 void performDiscovery() {
-  // switch to broadcast pipe & go to TX mode
   radio.openWritingPipe(broadcastPipe);
   radio.stopListening();
 
-  // build "TO:ALL|WHO"
-  char baseMsg[64];
-  buildCommandMessage(baseMsg, sizeof(baseMsg), "ALL", "WHO");
-
-  // send with ID prefix and 3× repeats
-  sendWithId(baseMsg);
-
+  sendCommand("ALL", "WHO");
   radio.txStandBy();
   Serial.println("OK");
 
-  // give radios a moment before listening
-  delay(10);
-
   // listen for replies
+  delay(10);
   radio.openReadingPipe(1, broadcastPipe);
   radio.startListening();
 
