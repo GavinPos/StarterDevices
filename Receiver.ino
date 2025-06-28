@@ -1,180 +1,122 @@
 #include <SPI.h>
 #include <RF24.h>
-#include <string.h>    // for strtok, strcmp, strncpy, etc.
 
-// ─── GLOBALS ────────────────────────────────────────────────────────────
-RF24 radio(9, 10);               // CE, CSN
+RF24 radio(9, 10);  // CE, CSN
 
-const byte broadcastPipe[6] = "BCAST";
-const byte commandPipe[6]   = "CMDCH";
-const char myID[]           = "01";  // 🟡 Numeric-only ID (2 chars)
+const char* thisDeviceAddr = "DEV01";  // 🔁 Set this per device
 
-// LED pins
+// LED pin definitions
 const int RED_LED    = 5;
 const int ORANGE_LED = 6;
 const int GREEN_LED  = 7;
 
-bool listeningToCommandPipe = false;
+// Time management
+unsigned long timeOffset = 0;  // masterTime - micros()
+unsigned long eventMicros[4];  // trigger times
+int currentStep = 0;
+int totalSteps  = 0;
 
-#define MSG_HISTORY_SIZE 20
-char msgHistory[MSG_HISTORY_SIZE][3];  // 20 slots of "XY\0"
-int  historyIndex = 0;                 // next slot to overwrite
-
-// ─── FORWARD DECLARATIONS ───────────────────────────────────────────────
-bool seenBefore(const char *id);
-void recordMsgId(const char *id);
-void allLedsOff();
-void blinkLedFor(const char* color, uint16_t durationMs, uint8_t blinkCount);
-bool idInList(const char *list, const char *id);
-
-// ─── SETUP ──────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  delay(500);
+  // Setup LEDs
+  pinMode(RED_LED, OUTPUT);
+  pinMode(ORANGE_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  allLedsOff();
 
-  // zero-clear our history buffer
-  memset(msgHistory, 0, sizeof(msgHistory));
-
-  // Radio init
+  // Setup radio
   radio.begin();
   radio.setPALevel(RF24_PA_MAX);
+  radio.setAutoAck(true);
   radio.setDataRate(RF24_250KBPS);
-  radio.enableDynamicPayloads();
-
-  // Start out listening on the broadcast pipe
-  radio.openReadingPipe(1, broadcastPipe);
+  radio.openReadingPipe(0, thisDeviceAddr);
   radio.startListening();
-
-  // LED pins
-  pinMode(RED_LED,    OUTPUT);
-  pinMode(ORANGE_LED, OUTPUT);
-  pinMode(GREEN_LED,  OUTPUT);
-  allLedsOff();
-
-  // Flash all lights once, then flash green LED at startup
-  digitalWrite(RED_LED, HIGH);
-  digitalWrite(ORANGE_LED, HIGH);
-  digitalWrite(GREEN_LED, HIGH);
-  delay(500);
-  allLedsOff();
-
-  int idNum = atoi(myID);
-  const uint16_t blinkDelay = 200;  // ms on/off per blink
-  for (int i = 0; i < idNum; i++) {
-    digitalWrite(GREEN_LED, HIGH);
-    delay(blinkDelay);
-    digitalWrite(GREEN_LED, LOW);
-    delay(blinkDelay);
-  }
 }
 
-// ─── MAIN LOOP ──────────────────────────────────────────────────────────
 void loop() {
-  if (!radio.available()) return;
+  if (radio.available()) {
+    char msg[32] = {0};
+    radio.read(&msg, sizeof(msg));
+    
+	if (strcmp(msg, "CHECK") == 0) {
+	  radio.stopListening();
+	  char reply[16];
+	  snprintf(reply, sizeof(reply), "ACK:%s", thisDeviceAddr + 3); // e.g. "ACK:03"
+	  radio.write(&reply, strlen(reply) + 1);
+	  radio.startListening();
+	}
 
-  char raw[32] = {0};
-  radio.read(raw, sizeof(raw));
-
-  char buf[32];
-  strncpy(buf, raw, sizeof(buf));
-  buf[sizeof(buf)-1] = '\0';
-
-  // Parse new format: msgId|deviceList|cmdChar
-  char *msgId      = strtok(buf, "|");
-  char *deviceList = strtok(nullptr, "|");
-  char *cmdField   = strtok(nullptr, "|");
-  if (!msgId || !deviceList || !cmdField) return;
-
-  // duplicate ID? skip
-  if (seenBefore(msgId)) return;
-  recordMsgId(msgId);
-
-  char cmdChar = cmdField[0];
-
-  // — WHO handler —  (deviceList == ALL, cmdChar == 'W')
-  if (!listeningToCommandPipe && strcmp(deviceList, "ALL") == 0 && cmdChar == 'W') {
-    // blink all LEDs to show alive
-    blinkLedFor("ALL", 200, 1);
-
-	// calculate response timeslot: each device has a 500ms window
-    int idNum = atoi(myID);
-    unsigned long slotDelay = (unsigned long)(idNum - 1) * 500UL;
-    delay(slotDelay);
-
-    // send our ID in our slot, with retries for reliability
-	// transmitter code will de-dup any additional responses
-    radio.stopListening();
-    radio.openWritingPipe(broadcastPipe);
-    for (int i = 0; i < 3; i++) {
-      radio.write(myID, strlen(myID) + 1, false);
-      radio.txStandBy();
-      delay(10);
+    else if (strncmp(msg, "SYNC:", 5) == 0) {
+      unsigned long masterMicros;
+      if (sscanf(msg + 5, "%lu", &masterMicros) == 1) {
+        timeOffset = masterMicros - micros();
+      }
     }
 
-    radio.openReadingPipe(1, commandPipe);
-    radio.startListening();
-    listeningToCommandPipe = true;
-    return;
+    else if (strncmp(msg, "SEQ:", 4) == 0) {
+      parseAndScheduleSequence(msg + 4);  // skip "SEQ:"
+    }
   }
 
-  // — Commands for us — (deviceList contains 'ALL' or includes our myID)
-  if (strcmp(deviceList, "ALL") == 0 || idInList(deviceList, myID)) {
-    allLedsOff();
-    if (cmdChar == 'R') {  // RESET
-      radio.stopListening();
-      radio.openReadingPipe(1, broadcastPipe);
-      radio.startListening();
-      listeningToCommandPipe = false;
-      allLedsOff();
-    }
-    else if (cmdChar == '0')    allLedsOff();
-    else if (cmdChar == '1')    digitalWrite(RED_LED,    HIGH);
-    else if (cmdChar == '2')    digitalWrite(ORANGE_LED, HIGH);
-    else if (cmdChar == '3')    digitalWrite(GREEN_LED,  HIGH);
+  runScheduledSteps();  // continuously check for trigger times
+}
+
+void parseAndScheduleSequence(const char* data) {
+  float timeSec[4];
+  int steps = 0;
+
+  char temp[32];
+  strncpy(temp, data, sizeof(temp));
+  temp[sizeof(temp) - 1] = '\0';
+
+  char* token = strtok(temp, "|");
+  while (token && steps < 4) {
+    timeSec[steps++] = atof(token);
+    token = strtok(NULL, "|");
+  }
+
+  unsigned long masterNow = micros() + timeOffset;
+	for (int i = 0; i < steps; i++) {
+	  eventMicros[i] = masterNow + (unsigned long)(timeSec[i] * 1000000UL) - timeOffset;
+	}
+  totalSteps = steps; 
+  currentStep = 0;
+}
+
+void runScheduledSteps() {
+  if (currentStep >= totalSteps || totalSteps == 0) return;
+
+  unsigned long now = micros();
+  if (now >= eventMicros[currentStep]) {
+    executeStep(currentStep);
+    currentStep++;
   }
 }
 
-// ─── MESSAGE HISTORY ────────────────────────────────────────────────────
-bool seenBefore(const char *id) {
-  for (int i = 0; i < MSG_HISTORY_SIZE; i++) if (strcmp(msgHistory[i], id) == 0) return true;
-  return false;
-}
+void executeStep(int step) {
 
-void recordMsgId(const char *id) {
-  strncpy(msgHistory[historyIndex], id, 2);
-  msgHistory[historyIndex][2] = '\0';
-  historyIndex = (historyIndex + 1) % MSG_HISTORY_SIZE;
-}
+  switch (step) {
+    case 0:  // RED ON
+      digitalWrite(RED_LED, HIGH);
+      break;
 
-// ─── LED HELPERS ─────────────────────────────────────────────────────────
-void allLedsOff() {
-  digitalWrite(RED_LED,    LOW);
-  digitalWrite(ORANGE_LED, LOW);
-  digitalWrite(GREEN_LED,  LOW);
-}
-
-void blinkLedFor(const char* color, uint16_t durationMs, uint8_t blinkCount) {
-  if (blinkCount == 0) return;
-  for (uint8_t i = 0; i < blinkCount; i++) {
-    if      (strcmp(color, "RED")    == 0) digitalWrite(RED_LED,    HIGH);
-    else if (strcmp(color, "ORANGE") == 0) digitalWrite(ORANGE_LED, HIGH);
-    else if (strcmp(color, "GREEN")  == 0) digitalWrite(GREEN_LED,  HIGH);
-    else if (strcmp(color, "ALL")    == 0) {
-      digitalWrite(RED_LED,    HIGH);
+    case 1:  // RED OFF, ORANGE ON
+      digitalWrite(RED_LED, LOW);
       digitalWrite(ORANGE_LED, HIGH);
-      digitalWrite(GREEN_LED,  HIGH);
-    }
-    delay(durationMs / (blinkCount * 2));
-    allLedsOff();
-    delay(durationMs / (blinkCount * 2));
+      break;
+
+    case 2:  // ORANGE OFF, GREEN ON
+      digitalWrite(ORANGE_LED, LOW);
+      digitalWrite(GREEN_LED, HIGH);
+      break;
+
+    case 3:  // ALL OFF
+      allLedsOff();
+      break;
   }
 }
 
-// ─── NEW HELPER: Check if a 2-character ID is in the concatenated list ───
-bool idInList(const char *list, const char *id) {
-  size_t len = strlen(list);
-  for (size_t i = 0; i + 1 < len; i += 2) {
-    if (strncmp(&list[i], id, 2) == 0) return true;
-  }
-  return false;
+void allLedsOff() {
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(ORANGE_LED, LOW);
+  digitalWrite(GREEN_LED, LOW);
 }
