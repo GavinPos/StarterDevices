@@ -55,6 +55,8 @@ void loop() {
       }
       // — Broadcast color test, sends commands to devices to cycle their lights —
       else if (strcasecmp(buf, "broadcast") == 0) {
+	radio.openWritingPipe(commandPipe);
+        radio.stopListening();
         // cycle commands 3→2→1→2→3→0
         sendCommand("ALL", '3'); delay(250);
         sendCommand("ALL", '2'); delay(250);
@@ -63,6 +65,7 @@ void loop() {
         sendCommand("ALL", '3'); delay(250);
         sendCommand("ALL", '0'); delay(250);
 
+	radio.txStandBy();
         Serial.println("Broadcast sequence complete.");
       }
       // — <devicelist> <cmd> —
