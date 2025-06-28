@@ -63,7 +63,7 @@ def test_all_devices():
     ser.flush()
     print(f"→ Sent: {cmd.strip()}")
 
-    # 3) Wait up to 10 s for the completion marker (no per‐line prints)
+    # 3) Wait up to 10 s for the completion marker (no per line prints)
     start = time.time()
     deadline = start + 10
     while time.time() < deadline:
@@ -109,7 +109,7 @@ def load_athletes(file_path=CSV_PATH):
 
 def send_all_reset_and_listen():
     """
-    Broadcast ALL RESET to serial and listen 5s for any "Device:XX" replies.
+    Broadcast ALL R (reset) to serial and listen 5s for any "Device:XX" replies.
     """
     global SERIAL_PORT
     init_serial()
@@ -117,7 +117,7 @@ def send_all_reset_and_listen():
     ser.reset_input_buffer()
     ser.reset_output_buffer()
 
-    ser.write(b'ALL RESET\n')
+    ser.write(b'ALL R\n')
 
     discovered = set()
     end_time = time.time() + 5
@@ -426,52 +426,71 @@ def build_device_schedule(racers):
             'green_off':  red_on + GREEN_D + OFF_D
         }
     return schedule
-
-
+            
 def start_race_sequence(racers):
     clear_screen()
     print("\n⏱️  Upcoming Command Sequence:")
     show_command_sequence(racers)
     if not racers:
-          return
+        return
     input("\nPress ENTER to start the race...")
+
     sched = build_device_schedule(racers)
-    events = [(t, dev, cmd) for dev, times in sched.items() for t, cmd in [
-        (times['red_on'], '1'),
-        (times['orange_on'], '2'),
-        (times['green_on'], '3'),
-        (times['green_off'], '0')
-    ]]
+    # Build raw events: list of (time, device, cmd)
+    raw_events = [(times['red_on'],    dev, '1')    for dev, times in sched.items()] + \
+                 [(times['orange_on'], dev, '2')    for dev, times in sched.items()] + \
+                 [(times['green_on'],  dev, '3')    for dev, times in sched.items()] + \
+                 [(times['green_off'], dev, '0')    for dev, times in sched.items()]
+    # Sort by event time
+    raw_events.sort(key=lambda e: e[0])
+
+    # Group events by (time, cmd) -> list of devices
+    grouped = {}
+    for t, dev, cmd in raw_events:
+        key = (round(t, 3), cmd)
+        grouped.setdefault(key, []).append(dev)
+
+    # Turn into list of (time, deviceList, cmd)
+    events = [(t, ''.join(devs), cmd) for (t, cmd), devs in grouped.items()]
+    # Sort final events by time
     events.sort(key=lambda e: e[0])
+
     global SERIAL_PORT
     init_serial()
-    
     ser.reset_input_buffer()
     ser.reset_output_buffer()
-    
-    t0 = time.time(); launched=False
-    for t_event, dev, cmd in events:
+
+    t0 = time.time()
+    launched = False
+    for t_event, dev_list, cmd in events:
         delay = t_event - (time.time() - t0)
-        if delay>0: time.sleep(delay)
-        ser.write(f"{dev} {cmd}\n".encode())
-        print(f"{time.time()-t0:>6.2f}s: {dev} {cmd}")
+        if delay > 0:
+            time.sleep(delay)
+        # Send grouped command: multiple devices in one transmission
+        message = f"{dev_list} {cmd}\n"
+        ser.write(message.encode())
+        print(f"{time.time()-t0:>6.2f}s: {dev_list} {cmd}")
+        # If 'Go' command, send start timer once
         if cmd == '3' and not launched:
             send_start_command()
             launched = True
  
  
 def send_start_command(host="127.0.0.1", port=6000, payload=b"s"):
-    for attempt in range(1, 6):
-        try:
-            with socket.create_connection((host, port), timeout=0.2) as sock:
-                sock.sendall(payload)
-            print(f"✅ Sent “{payload!r}” on attempt {attempt}")
-            return
-        except Exception as e:
-            print(f"⚠️  Start‐cmd attempt {attempt} failed: {e}")
-            time.sleep(0.05)
-    print("❌ Giving up on starting timer!")
-
+    try:
+        for attempt in range(1, 6):
+            try:
+                with socket.create_connection((host, port), timeout=0.2) as sock:
+                    sock.sendall(payload)
+                print(f"✅ Sent {payload!r} on attempt {attempt}")
+                return  # success, drop out
+            except Exception as e:
+                print(f"⚠️  Start-cmd attempt {attempt} failed: {e}")
+                time.sleep(0.05)
+        print("❌ Giving up on starting timer!")
+    except Exception as e:
+        # Catch anything unexpected so this function never bubbles an error
+        print(f"⚠️  Unexpected error in send_start_command: {e}")
 
 def show_device_schedule(racers):
     clear_screen()
