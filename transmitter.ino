@@ -1,37 +1,24 @@
 #include <SPI.h>
 #include <RF24.h>
 
-// ─── GLOBALS ────────────────────────────────────────────────────────────
-RF24    radio(9, 10);                // CE, CSN
-const byte broadcastPipe[6] = "BCAST";
-const byte commandPipe[6]  = "CMDCH";
+RF24 radio(9, 10);  // CE, CSN
 
-const int MAX_DEVICES = 99;
-char  discoveredIDs[MAX_DEVICES][3];  // store as 2-char strings + null
-int   deviceCount = 0;
+static const byte slaveAddrs[][6] = { "DEV00", "DEV01", "DEV02", "DEV03", "DEV04", "DEV05", "DEV06", "DEV07" };
+const int NUM_SLAVES = 2;
 
-// ─── MESSAGE ID COUNTER ─────────────────────────────────────────────────
-uint8_t nextMsgId = 0;  // will roll 00→99
+unsigned long startDelaySec = 2;
 
-// ─── FORWARD DECLARATIONS ───────────────────────────────────────────────
-void performDiscovery();
-void sendCommand(const char *deviceList, char cmd);
-
-// ─── SETUP ──────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
   radio.begin();
-  radio.setRetries(5, 15);
   radio.setPALevel(RF24_PA_MAX);
+  radio.setAutoAck(true);
+  radio.setRetries(5, 15);
   radio.setDataRate(RF24_250KBPS);
-  radio.enableDynamicPayloads();
 }
 
-// ─── MAIN LOOP ──────────────────────────────────────────────────────────
 void loop() {
-  static char buf[64];
+  static char buf[160];
   static size_t idx = 0;
 
   while (Serial.available()) {
@@ -42,128 +29,181 @@ void loop() {
       buf[idx] = '\0';
       idx = 0;
 
-      // — List devices that are already registered —
-      if (strcasecmp(buf, "devices") == 0) {
-        if (deviceCount == 0) {
-          Serial.println("None Registered");
-        } else {
-          for (int i = 0; i < deviceCount; i++) {
-            Serial.print("Device: ");
-            Serial.println(discoveredIDs[i]);
-          }
+      if (strcasecmp(buf, "DISCOVER") == 0) {
+        for (int i = 0; i < NUM_SLAVES; i++) {
+          checkSlave(i);
+          delay(10);
         }
       }
-      // — Broadcast color test, sends commands to devices to cycle their lights —
-      else if (strcasecmp(buf, "broadcast") == 0) {
-	radio.openWritingPipe(commandPipe);
-        radio.stopListening();
-        // cycle commands 3→2→1→2→3→0
-        sendCommand("ALL", '3'); delay(250);
-        sendCommand("ALL", '2'); delay(250);
-        sendCommand("ALL", '1'); delay(250);
-        sendCommand("ALL", '2'); delay(250);
-        sendCommand("ALL", '3'); delay(250);
-        sendCommand("ALL", '0'); delay(250);
-
-	radio.txStandBy();
-        Serial.println("Broadcast sequence complete.");
-      }
-      // — <devicelist> <cmd> —
-      else {
-        char deviceList[27] = {0};
-        char cmdChar[2]     = {0};
-
-        if (sscanf(buf, "%26s %1s", deviceList, cmdChar) == 2) {
-          Serial.print("Command Sent: ");
-          radio.openWritingPipe(commandPipe);
-          radio.stopListening();
-          sendCommand(deviceList, cmdChar[0]);
-          Serial.println("OK");
-
-		// upon a RESET 'R' request, the reset has been sent to the devices to 
-		// switch from command mode to broadcast mode, we then automatically 
-		// send a who request on the broadcast channel for all to respond to
-		// in a staggered manner
-          if (cmdChar[0] == 'R') { // for RESET
-            delay(200);
-            performDiscovery();
-          }
-        } else {
-          Serial.println("❌ Invalid input. Use: <2-char IDs…> <cmd>");
+      else if (strcasecmp(buf, "SYNC") == 0) {
+        for (int i = 0; i < NUM_SLAVES; i++) {
+          sendSync(i);
+          delay(10);
         }
       }
-    }
-    else {
+      else if (strcasecmp(buf, "FLASH") == 0) {
+        for (int i = 0; i < NUM_SLAVES; i++) {
+          sendFlash(i);
+          delay(10);
+        }
+      }
+      else if (strncasecmp(buf, "START:", 6) == 0) {
+        handleMultiStart(buf + 6);
+      }
+    } else {
       buf[idx++] = c;
     }
   }
 }
 
-// ─── SENDER ─────────────────────────────────────────────────────────────
-// Message: <2-digit MsgID>|<2-charID×n…>|<cmdChar>
-void sendCommand(const char *deviceList, char cmd) {
-  nextMsgId = (nextMsgId + 1) % 100;
-
-  char fullMsg[80];
-  char idStr[3];
-  snprintf(idStr, sizeof(idStr), "%02u", nextMsgId);
-  snprintf(fullMsg, sizeof(fullMsg), "%s|%s|%c", idStr, deviceList, cmd);
-
-  for (int i = 0; i < 3; i++) {
-    radio.write(fullMsg, strlen(fullMsg) + 1, false);
-    Serial.print("Full Command Sent: ");
-    Serial.println(fullMsg);
-    radio.txStandBy();
-    delay(5);
-  }
-}
-
-// ─── DISCOVERY ──────────────────────────────────────────────────────────
-void performDiscovery() {
-	// all devices should now be on the broadcast channel, listening
-  radio.openWritingPipe(broadcastPipe);
+void checkSlave(int idx) {
+  radio.openWritingPipe(slaveAddrs[idx]);
   radio.stopListening();
-
-  // ask all radios to respond with their 2-char ID
-  sendCommand("ALL", 'W'); // interpret 'W' for WHO
-  radio.txStandBy();
-  Serial.println("OK");
-
-  delay(10);
-  radio.openReadingPipe(1, broadcastPipe);
+  bool ok = false;
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    ok = radio.write("CHECK", 5);
+    if (ok) break;
+    delay(10);
+  }
   radio.startListening();
 
-  deviceCount = 0;
-  unsigned long start = millis();
-  // waiting for 5 seconds for all channels to report in, each device has a 
-  // 500 millisecond window to reply within
-  while (millis() - start < 5000) {
-    if (radio.available()) {
-      char id[3] = {0};
-      radio.read(&id, sizeof(id));
+  Serial.print("CHECK "); Serial.print((char*)slaveAddrs[idx]);
+  Serial.print(ok ? " ACKed" : " FAILED");
+  Serial.println();
+}
 
-      bool found = false;
-      for (int i = 0; i < deviceCount; i++) {
-        if (strcmp(id, discoveredIDs[i]) == 0) {
-          found = true;
-          break;
-        }
-      }
-      if (!found && deviceCount < MAX_DEVICES) {
-        strcpy(discoveredIDs[deviceCount], id);
-        deviceCount++;
-      }
+void sendSync(int idx) {
+  unsigned long masterMicros = micros();
+  char buf[32];
+  snprintf(buf, sizeof(buf), "SYNC:%lu", masterMicros);
+
+  radio.openWritingPipe(slaveAddrs[idx]);
+  radio.stopListening();
+  bool ok = radio.write(buf, strlen(buf) + 1);
+  radio.startListening();
+
+  Serial.print("SYNC  "); Serial.print((char*)slaveAddrs[idx]);
+  Serial.print(ok ? " OK" : " FAIL");
+  Serial.print(" @"); Serial.println(masterMicros);
+}
+
+void sendStartSequence(int idx, const char *stepList, unsigned long masterStartTime) {
+  sendSync(idx);
+
+  char buf[128] = "ST:";
+  strcat(buf, stepList);
+
+  char timeStr[32];
+  snprintf(timeStr, sizeof(timeStr), ":%lu", masterStartTime);
+  strcat(buf, timeStr);
+
+  radio.openWritingPipe(slaveAddrs[idx]);
+  radio.stopListening();
+  bool ok = radio.write(buf, strlen(buf) + 1);
+  radio.startListening();
+
+  Serial.print("START "); Serial.print((char*)slaveAddrs[idx]);
+  Serial.println(ok ? " OK" : " FAIL");
+}
+
+void sendFlash(int idx) {
+  radio.openWritingPipe(slaveAddrs[idx]);
+  radio.stopListening();
+  bool ok = false;
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    ok = radio.write("FLASH:", 6);
+    if (ok) break;
+    delay(10);
+  }
+  radio.startListening();
+
+  Serial.print("FLASH "); Serial.print((char*)slaveAddrs[idx]);
+  Serial.println(ok ? " OK" : " FAIL");
+}
+
+// Handles START:00{0,2,5,8};01{1,4,6};...
+void handleMultiStart(const char *input) {
+  // compute when “time zero” is (master time + delay)
+  unsigned long masterStartTime = micros() + startDelaySec * 1000000UL;
+  Serial.print("Master Start Time: "); Serial.println(masterStartTime);
+
+  // make a mutable copy of the “00{…};01{…};...” string
+  char buf[160];
+  strncpy(buf, input, sizeof(buf));
+  buf[sizeof(buf)-1] = '\0';
+
+  unsigned long earliestGreenTime = 0xFFFFFFFFUL;
+
+  // ─── outer split on “;” ──────────────────────────────────────────────
+  char *saveptr1;
+  char *entry = strtok_r(buf, ";", &saveptr1);
+  while (entry) {
+    // find the {…} region
+    char *openBrace  = strchr(entry, '{');
+    char *closeBrace = strchr(entry, '}');
+    if (!openBrace || !closeBrace || closeBrace < openBrace) {
+      Serial.println("Invalid entry format");
+      entry = strtok_r(NULL, ";", &saveptr1);
+      continue;
     }
+
+    // parse the two‐digit ID
+    char idStr[3] = { entry[0], entry[1], '\0' };
+    int  id       = atoi(idStr);
+    if (id < 0 || id >= NUM_SLAVES) {
+      Serial.print("Invalid ID: "); Serial.println(idStr);
+      entry = strtok_r(NULL, ";", &saveptr1);
+      continue;
+    }
+
+    // copy out exactly what's between the braces
+    char rawSteps[64];
+    int  rawLen = closeBrace - openBrace - 1;
+    strncpy(rawSteps, openBrace + 1, rawLen);
+    rawSteps[rawLen] = '\0';
+
+    // build the “pipe”‐separated list for RF
+    char pipeSteps[64];
+    strncpy(pipeSteps, rawSteps, sizeof(pipeSteps));
+    for (int i = 0; pipeSteps[i]; i++) {
+      if (pipeSteps[i] == ',') pipeSteps[i] = '|';
+    }
+
+    // ─── inner split on “,” to find the 3rd (green) value ────────────
+    char *saveptr2;
+    char *tok = strtok_r(rawSteps, ",", &saveptr2);
+    int   idx = 0;
+    int   greenOffset = -1;
+    while (tok) {
+      if (idx == 2) {
+        greenOffset = atoi(tok);
+        break;
+      }
+      tok = strtok_r(NULL, ",", &saveptr2);
+      idx++;
+    }
+
+    // schedule the green time, track earliest
+    if (greenOffset >= 0) {
+      unsigned long gtime = masterStartTime + (unsigned long)greenOffset * 1000000UL;
+      if (gtime < earliestGreenTime) earliestGreenTime = gtime;
+    }
+
+    // send the START packet to this slave
+    sendStartSequence(id, pipeSteps, masterStartTime);
+    delay(10);
+
+    // move to the next “ID{…}”
+    entry = strtok_r(NULL, ";", &saveptr1);
   }
 
-  radio.stopListening();
-  Serial.println("Discovery complete.");
-  if (deviceCount == 0) {
-    Serial.println("No Devices Registered");
-  } else {
-    for (int i = 0; i < deviceCount; i++) {
-      Serial.print("Device: ");
-      Serial.println(discoveredIDs[i]);
+  // ─── finally, wait and fire the very first green light ─────────────
+  if (earliestGreenTime != 0xFFFFFFFFUL) {
+    while (micros() < earliestGreenTime) {
+      // you could do a non-blocking blink or whatever here
+      delay(1);
     }
+    Serial.println("STARTTIMER");
   }
 }
+
