@@ -3,7 +3,7 @@
 
 RF24 radio(9, 10);  // CE, CSN
 
-const char* thisDeviceAddr = "DEV01";  // 🔁 Set this per device
+static const byte thisDeviceAddr[6] = "DEV00";  // 🔁 Set this per device
 
 // LED pin definitions
 const int RED_LED    = 5;
@@ -30,6 +30,15 @@ void setup() {
   radio.setDataRate(RF24_250KBPS);
   radio.openReadingPipe(0, thisDeviceAddr);
   radio.startListening();
+  
+  for (int i = 0; i < 3; i++) {
+	  digitalWrite(RED_LED, HIGH);
+	  digitalWrite(ORANGE_LED, HIGH);
+	  digitalWrite(GREEN_LED, HIGH);
+	  delay(250);
+	  allLedsOff();
+	  delay(250);
+  }
 }
 
 void loop() {
@@ -45,15 +54,20 @@ void loop() {
 	  radio.startListening();
 	}
 
-    else if (strncmp(msg, "SYNC:", 5) == 0) {
-      unsigned long masterMicros;
-      if (sscanf(msg + 5, "%lu", &masterMicros) == 1) {
-        timeOffset = masterMicros - micros();
-      }
+  else if (strncmp(msg, "SYNC:", 5) == 0) {
+    unsigned long masterMicros;
+    if (sscanf(msg + 5, "%lu", &masterMicros) == 1) {
+      unsigned long localtime = micros();
+      timeOffset = localtime - masterMicros;
     }
+  }
 
-    else if (strncmp(msg, "SEQ:", 4) == 0) {
-      parseAndScheduleSequence(msg + 4);  // skip "SEQ:"
+  else if (strncmp(msg, "ST:", 3) == 0) {
+    parseAndScheduleSequence(msg + 3);  // skip "ST:"
+  }
+	
+	else if (strncmp(msg, "FLASH:", 6) == 0) {
+      flashLights();
     }
   }
 
@@ -68,15 +82,23 @@ void parseAndScheduleSequence(const char* data) {
   strncpy(temp, data, sizeof(temp));
   temp[sizeof(temp) - 1] = '\0';
 
+  char* colon = strrchr(temp, ':');
+  unsigned long masterStart = 0;
+  if (colon) {
+    *colon = '\0';                  // terminate the step‐list portion
+    masterStart = strtoul(colon+1, NULL, 10);
+  } 
+
   char* token = strtok(temp, "|");
   while (token && steps < 4) {
     timeSec[steps++] = atof(token);
     token = strtok(NULL, "|");
   }
+ 
+  unsigned long masterNow = masterStart + timeOffset;
 
-  unsigned long masterNow = micros() + timeOffset;
 	for (int i = 0; i < steps; i++) {
-	  eventMicros[i] = masterNow + (unsigned long)(timeSec[i] * 1000000UL) - timeOffset;
+	  eventMicros[i] = masterNow + (unsigned long)(timeSec[i] * 1000000UL);
 	}
   totalSteps = steps; 
   currentStep = 0;
@@ -113,6 +135,20 @@ void executeStep(int step) {
       allLedsOff();
       break;
   }
+}
+
+void flashLights(){
+	for (int i = 0; i < 3; i++) {
+		digitalWrite(GREEN_LED, HIGH);
+		delay(200);
+		digitalWrite(GREEN_LED, LOW);
+		digitalWrite(ORANGE_LED, HIGH);
+		delay(200);
+		digitalWrite(ORANGE_LED, LOW);
+		digitalWrite(RED_LED, HIGH);
+		delay(200);
+		digitalWrite(RED_LED, LOW);
+	}
 }
 
 void allLedsOff() {
