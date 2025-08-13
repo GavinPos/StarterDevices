@@ -90,7 +90,16 @@ void setup() {
 void loop() {
   if (radio.available()) {
     char msg[32] = {0};
-    radio.read(&msg, sizeof(msg));
+    // If you use dynamic payloads, get the real size defensively
+    uint8_t len = 32;
+    #ifdef RF24_DYNAMIC_PAYLOADS
+      uint8_t dyn = radio.getDynamicPayloadSize();
+      if (dyn == 0 || dyn > sizeof(msg)) { radio.flush_rx(); break; }
+      len = dyn;
+    #endif
+
+    memset(msg, 0, sizeof(msg));
+    radio.read(msg, len);   // NOTE: no '&' here
 
     if (strcmp(msg, "CHECK") == 0) {
       // (Auto-ACK handles the ack bit itself)
@@ -108,16 +117,16 @@ void loop() {
       // preload ack payload "RDY:<seq>" so TX can fetch it with a PING
       // (parseAndScheduleSequenceV2 calls preloadAckReady)
     }
-    else if (strncmp(msg, "ST:", 3) == 0) {
-      // legacy path kept for compatibility (no READY ack)
-      parseAndScheduleSequence(msg + 3);
-    }
+
     else if (strncmp(msg, "PING:", 5) == 0) {
       // TX is polling for READY ack payload; do nothing here.
       // If ST2 was processed, an ack payload is already queued.
     }
     else if (strncmp(msg, "FLASH:", 6) == 0) {
       flashLights();
+	  
+	  radio.flush_rx();
+      radio.startListening(); 
     }
   }
 
