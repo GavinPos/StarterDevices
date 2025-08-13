@@ -9,7 +9,7 @@ const int NUM_SLAVES = 8;
 unsigned long startDelaySec = 2;
 
 // Default volume (0..30) if a device block omits @<vol>
-uint8_t deviceVolume = 30;
+uint8_t deviceVolume = 20;
 
 // New: sequence id (advance once per START batch)
 static uint16_t seqId = 1;
@@ -134,6 +134,7 @@ bool pollReadyAck(int idx, uint16_t expectSeq) {
 
 // UPDATED: now includes seq + per-device volume and READY polling
 void sendStartSequence(int idx, const char *stepList, unsigned long masterStartTime, uint8_t vol) {
+  sendSync(idx);
   // Build ST2 packet: ST2:<seq>|<t0|t1|...>:<masterStart>:<vol>
   char buf[128] = "ST2:";
 
@@ -152,9 +153,7 @@ void sendStartSequence(int idx, const char *stepList, unsigned long masterStartT
   txBeginTo(idx);
   bool ok = radio.write(buf, strlen(buf) + 1);
   txEnd();
-  
-  sendSync(idx);
-
+ 
   Serial.print("START "); Serial.print((char*)slaveAddrs[idx]);
   Serial.print(ok ? " TXOK " : " TXFAIL ");
   Serial.print("Payload='"); Serial.print(buf); Serial.println("'");
