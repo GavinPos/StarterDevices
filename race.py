@@ -6,12 +6,11 @@ import serial.tools.list_ports
 import socket
 
 CSV_PATH = "data/athletes.csv"
-CSV_PATH2= "data/athletes2.csv"
+CSV_PATH2 = "data/athletes2.csv"
 SESSION_FILE = "data/sessions.csv"
 SERIAL_PORT = None
 BAUD_RATE = 115200
 SERIAL_TIMEOUT = 1
-
 WRITE_TIMEOUT  = 1       # max seconds to block on write
 
 # Global state
@@ -26,7 +25,6 @@ def detect_serial_port():
         if "Arduino" in p.description or "ttyUSB" in p.device or "ttyACM" in p.device:
             return p.device
     raise IOError("❌ Could not auto-detect Arduino serial port. Is it connected?")
-
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -47,40 +45,47 @@ def init_serial():
             ser.reset_output_buffer()
         else:
             init_serial()
-
         time.sleep(2)   # give Arduino time after reset
 
-def test_all_devices():
+def test_all_devices(timeout=2):
+    """
+    Send FLASH to the Arduino (which will flash each slave),
+    then listen for any "FLASH DEVxx OK" or "FLASH DEVxx FAIL" replies.
+    Prints results and returns a list of all DEVxx that ACKed.
+    """
+    global SERIAL_PORT
     init_serial()
-
-    # 1) Clear any old data
     ser.reset_input_buffer()
     ser.reset_output_buffer()
+    ser.write(b'FLASH\n')
 
-    # 2) Send the broadcast command
-    cmd = "broadcast\n"
-    ser.write(cmd.encode())
-    ser.flush()
-    print(f"→ Sent: {cmd.strip()}")
+    ok_devices = []
+    end_time = time.time() + timeout
 
-    # 3) Wait up to 10 s for the completion marker (no per line prints)
-    start = time.time()
-    deadline = start + 10
-    while time.time() < deadline:
-        if ser.in_waiting:
-            line = ser.readline().decode(errors='ignore').strip()
-            if not line:
+    while time.time() < end_time:
+        if ser.in_waiting > 0:
+            raw = ser.readline()
+            try:
+                line = raw.decode('utf-8', errors='ignore').strip()
+            except:
                 continue
-            if line.lower() == "broadcast sequence complete.":
-                elapsed = time.time() - start
-                print(f"✅ Broadcast complete in {elapsed:.3f}s\n")
-                break
+            if line.startswith("FLASH "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    addr, status = parts[1], parts[2].upper()
+                    dev_id = addr[-2:]
+                    if status == "OK":
+                        ok_devices.append(dev_id)
+
+    if not ok_devices:
+        print("⚠️ No devices flashed successfully.")
     else:
-        print(f"⚠️  No completion message after {10:.1f}s.\n")
+        for d in sorted(ok_devices, key=lambda x: int(x)):
+            print(f"✅ FLASH OK on device: {d}")
 
-    input("Press ENTER to continue...")
+    input("Press ENTER to continue…")
+    return ok_devices
 
-    
 def load_athletes(file_path=CSV_PATH):
     """
     Load athletes from CSV. Expects columns:
@@ -106,35 +111,43 @@ def load_athletes(file_path=CSV_PATH):
             athletes[aid] = {"name": name, "pbs": pbs}
     return athletes
 
-
 def send_all_reset_and_listen():
     """
-    Broadcast ALL R (reset) to serial and listen 5s for any "Device:XX" replies.
+    Tell the Arduino to run its DISCOVER sequence, then listen for 2 s
+    for any "CHECK DEVxx ACKed" replies. Prints all found devices
+    only after the window closes.
     """
     global SERIAL_PORT
     init_serial()
-    
     ser.reset_input_buffer()
     ser.reset_output_buffer()
-
-    ser.write(b'ALL R\n')
+    ser.write(b'DISCOVER\n')
 
     discovered = set()
-    end_time = time.time() + 5
-    while time.time() < end_time:
-        if ser.in_waiting>0:
-            raw = ser.readline()
-            line = raw.decode('utf-8', errors='ignore').strip()
-            if line.startswith("Device:"):
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    dev_id = parts[1].strip()
-                    if dev_id not in discovered:
-                        discovered.add(dev_id)
-                        print(f"✅ Found device: {dev_id}")
-    input("Press ENTER to continue...")
-    return list(discovered)
+    end_time = time.time() + 2
 
+    while time.time() < end_time:
+        if ser.in_waiting > 0:
+            raw = ser.readline()
+            try:
+                line = raw.decode('utf-8', errors='ignore').strip()
+            except:
+                continue
+            if line.startswith("CHECK "):
+                parts = line.split()
+                if len(parts) >= 3 and parts[2].upper() == "ACKED":
+                    addr = parts[1]
+                    dev_id = addr[-2:]
+                    discovered.add(dev_id)
+
+    if not discovered:
+        print("⚠️  No devices responded.")
+    else:
+        for dev_id in sorted(discovered, key=lambda x: int(x)):
+            print(f"✅ Found device: {dev_id}")
+
+    input("Press ENTER to continue…")
+    return list(discovered)
 
 def get_race_participants(athletes, start_points):
     racers = {}
@@ -149,11 +162,10 @@ def get_race_participants(athletes, start_points):
                     if aid not in athletes:
                         print("❌ ID not found.")
                         continue
-                    #racers[aid] = {"name": athletes[aid]["name"], "pbs": athletes[aid]["pbs"].copy()}
                     racers[aid] = {
                         "name": athletes[aid]["name"],
-                        "pbs":  athletes[aid]["pbs"].copy(),
-                        "start_point": dist      # ← record the event distance
+                        "pbs": athletes[aid]["pbs"].copy(),
+                        "start_point": dist
                     }
                     sp["assignments"][f"Lane {lane}"] = aid
                     break
@@ -169,15 +181,13 @@ def get_race_participants(athletes, start_points):
                 if aid in racers:
                     print("⚠️ Already added.")
                     continue
-                #racers[aid] = {"name": athletes[aid]["name"], "pbs": athletes[aid]["pbs"].copy()}
                 racers[aid] = {
                     "name": athletes[aid]["name"],
-                    "pbs":  athletes[aid]["pbs"].copy(),
+                    "pbs": athletes[aid]["pbs"].copy(),
                     "start_point": dist
                 }
                 sp["assignments"][aid] = aid
     return racers
-
 
 def calculate_staggered_starts(racers, distance):
     """
@@ -193,18 +203,15 @@ def calculate_staggered_starts(racers, distance):
         r['start'] = round(slowest_pb - pb_val, 3) if pb_val is not None else 0.0
     return racers
 
-
 def define_start_points():
     valid = ["60", "100", "200", "300", "400", "800", "1500"]
     opts = ", ".join(valid)
 
     while True:
-        # 1) Clear & show header
         clear_screen()
         print("=== Define Start Points ===\n")
         print(f"Valid distances: {opts}")
 
-        # 2) Show existing
         if start_points:
             print("Already defined:")
             for d, sp in sorted(start_points.items(), key=lambda x: int(x[0])):
@@ -214,21 +221,14 @@ def define_start_points():
                     print(f"  • {d} m  → no lanes")
             print()
 
-        # 3) Prompt
         dist = input("Enter distance, 'c' to clear, or press ENTER to finish: ").strip().lower()
-
-        # 3a) Clear-all option
         if dist == 'c':
             confirm = input("❗ This will remove all start points. Are you sure? (y/n): ").strip().lower()
             if confirm == 'y':
                 start_points.clear()
-            continue  # redisplay menu
-
-        # 3b) Finish
+            continue
         if dist == "":
             break
-
-        # 4) Validate
         if dist not in valid:
             print(f"\n❌ Invalid distance. Choose from: {opts}")
             input("\nPress ENTER to try again…")
@@ -238,7 +238,6 @@ def define_start_points():
             input("\nPress ENTER to try again…")
             continue
 
-        # 5) Gather lanes info
         resp = input("Defined lanes? (y/n): ").strip().lower()
         has_lanes = (resp == "y")
         num_lanes = 0
@@ -250,7 +249,6 @@ def define_start_points():
                     break
                 print("❌ Enter a positive integer for lanes.")
 
-        # 6) Save and loop (will auto-refresh view)
         start_points[dist] = {
             "has_lanes": has_lanes,
             "num_lanes": num_lanes,
@@ -258,7 +256,6 @@ def define_start_points():
             "assignments": {},
             "device_assignments": {}
         }
-
 
 def add_virtual_devices():
     """
@@ -301,7 +298,6 @@ def add_virtual_devices():
         print()
     return devices
 
-
 def collect_start_point_timings(start_points, athletes):
     data = {}
     for dist, sp in start_points.items():
@@ -328,7 +324,6 @@ def collect_start_point_timings(start_points, athletes):
         data[dist] = rows
     return data
 
-
 def calculate_timings(racers):
     """
     Loop through all defined start points, display per-distance PB & headstart tables,
@@ -337,10 +332,8 @@ def calculate_timings(racers):
     clear_screen()
     print("=== Start Point Timings ===")
 
-    # 1) Collect timing data for every distance
     timing_data = collect_start_point_timings(start_points, athletes)
 
-    # 2) Display tables for each distance automatically
     for dist, rows in timing_data.items():
         print(f"--- {dist}m ---")
         if not rows:
@@ -354,7 +347,6 @@ def calculate_timings(racers):
                       f"{row['pb']:<8.2f}{row['start']:<10.2f}")
     input("Press ENTER to return...")
 
-    # 3) Inject data back into racers for every distance
     for dist, rows in timing_data.items():
         sp = start_points[dist]
         if sp['has_lanes']:
@@ -373,14 +365,12 @@ def calculate_timings(racers):
 
     return timing_data
 
-
 def show_command_sequence(racers):
     if not racers:
         print("❌ No race has been set up yet.")
         input("\nPress ENTER to continue...")
         return
 
-    # build and sort the event list as before
     sched = build_device_schedule(racers)
     events = []
     for dev, t in sched.items():
@@ -392,14 +382,7 @@ def show_command_sequence(racers):
         ]
     events.sort(key=lambda e: e[0])
 
-    # mapping from code → word
-    code_map = {
-        '0': "-",
-        '1': "Marks",
-        '2': "Set",
-        '3': "Go"
-        # leave '0' as-is, or add '0': "Off" if you like
-    }
+    code_map = {'0': "-", '1': "Marks", '2': "Set", '3': "Go"}
 
     print("\n⏱️  Command Sequence:")
     print(f"{'Time(s)':<8}{'Device':<12}{'Action'}")
@@ -408,12 +391,11 @@ def show_command_sequence(racers):
         action = code_map.get(cmd, cmd)
         print(f"{t:>7.2f}  {dev:<12} {action}")
 
-
 def build_device_schedule(racers):
     starts = [r.get('start', 0.0) for r in racers.values()]
     min_start = min(starts) if starts else 0.0
     schedule = {}
-    RED_D = 5.0; ORANGE_D = 5.0; GREEN_D = 10.0; OFF_D = 8.0
+    RED_D = 5.0; ORANGE_D = 7.0; GREEN_D = 9.0; OFF_D = 11.0
     for aid, r in racers.items():
         dev = r.get('device', '-')
         red_on = r.get('start', 0.0) - min_start
@@ -421,75 +403,68 @@ def build_device_schedule(racers):
             'red_on':     red_on,
             'red_off':    red_on + RED_D,
             'orange_on':  red_on + RED_D,
-            'orange_off': red_on + RED_D + ORANGE_D,
+            'orange_off': red_on + ORANGE_D,
             'green_on':   red_on + GREEN_D,
-            'green_off':  red_on + GREEN_D + OFF_D
+            'green_off':  red_on + OFF_D
         }
     return schedule
-            
+
 def start_race_sequence(racers):
+    """
+    Uses the new transmitter’s built-in START:… model:
+      • Compute each device’s [red, orange, green, off] offsets
+      • Send one START:<ID>{r,o,g,f};… command
+      • Let the Arduino handle the timing and print “STARTTIMER” when it fires
+    """
     clear_screen()
     print("\n⏱️  Upcoming Command Sequence:")
     show_command_sequence(racers)
     if not racers:
         return
-    input("\nPress ENTER to start the race...")
+    input("\nPress ENTER to start the race…")
 
     sched = build_device_schedule(racers)
-    # Build raw events: list of (time, device, cmd)
-    raw_events = [(times['red_on'],    dev, '1')    for dev, times in sched.items()] + \
-                 [(times['orange_on'], dev, '2')    for dev, times in sched.items()] + \
-                 [(times['green_on'],  dev, '3')    for dev, times in sched.items()] + \
-                 [(times['green_off'], dev, '0')    for dev, times in sched.items()]
-    # Sort by event time
-    raw_events.sort(key=lambda e: e[0])
+    entries = []
+    for dev, times in sched.items():
+        r = int(round(times['red_on']))
+        o = int(round(times['orange_on']))
+        g = int(round(times['green_on']))
+        f = int(round(times['green_off']))
+        entries.append(f"{dev}{{{r},{o},{g},{f}}}")
 
-    # Group events by (time, cmd) -> list of devices
-    grouped = {}
-    for t, dev, cmd in raw_events:
-        key = (round(t, 3), cmd)
-        grouped.setdefault(key, []).append(dev)
+    cmd_str = "START:" + ";".join(entries) + ";\n"
 
-    # Turn into list of (time, deviceList, cmd)
-    events = [(t, ''.join(devs), cmd) for (t, cmd), devs in grouped.items()]
-    # Sort final events by time
-    events.sort(key=lambda e: e[0])
-
-    global SERIAL_PORT
     init_serial()
     ser.reset_input_buffer()
     ser.reset_output_buffer()
+    ser.write(cmd_str.encode())
+    print(f"📤 Sent to transmitter: {cmd_str.strip()}")
 
-    t0 = time.time()
-    launched = False
-    for t_event, dev_list, cmd in events:
-        delay = t_event - (time.time() - t0)
-        if delay > 0:
-            time.sleep(delay)
-        # Send grouped command: multiple devices in one transmission
-        message = f"{dev_list} {cmd}\n"
-        ser.write(message.encode())
-        print(f"{time.time()-t0:>6.2f}s: {dev_list} {cmd}")
-        # If 'Go' command, send start timer once
-        if cmd == '3' and not launched:
-            send_start_command()
-            launched = True
- 
- 
+    print("⏳ Waiting for Arduino to fire the start…")
+    while True:
+        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        if not line:
+            continue
+        print(f"📡 {line}")
+        if line == "STARTTIMER":
+            send_start_command() 
+            print("🚦 Race started!")
+            break
+
 def send_start_command(host="127.0.0.1", port=6000, payload=b"s"):
+    print(f"📡 Connecting to {host}:{port}...")
     try:
         for attempt in range(1, 6):
             try:
                 with socket.create_connection((host, port), timeout=0.2) as sock:
                     sock.sendall(payload)
                 print(f"✅ Sent {payload!r} on attempt {attempt}")
-                return  # success, drop out
+                return
             except Exception as e:
                 print(f"⚠️  Start-cmd attempt {attempt} failed: {e}")
                 time.sleep(0.05)
         print("❌ Giving up on starting timer!")
     except Exception as e:
-        # Catch anything unexpected so this function never bubbles an error
         print(f"⚠️  Unexpected error in send_start_command: {e}")
 
 def show_device_schedule(racers):
@@ -499,17 +474,11 @@ def show_device_schedule(racers):
         input("\nPress ENTER to continue...")
         return
 
-    # Build device light schedule
     sched = build_device_schedule(racers)
-
-    # Header: include device, start point (distance), lane, and start times for each LED
     print("\n📋 Device Light Schedule (start times for each LED)\n")
     print(f"{'Device':<8}{'Distance':<10}{'Lane':<8}{'Red(s)':<10}{'Orange(s)':<12}{'Green(s)':<10}")
     print("-" * 58)
-
-    # For each device, determine its distance, lane, and LED start times
     for dev, times in sched.items():
-        # Locate distance and lane assignment
         distance = '-'
         lane = '-'
         for dist, sp in start_points.items():
@@ -525,21 +494,14 @@ def show_device_schedule(racers):
                     lane = '-'
             if distance != '-' and (sp['has_lanes'] and lane != '-' or not sp['has_lanes']):
                 break
-
-        # Extract LED start times
         red_start = times['red_on']
         orange_start = times['orange_on']
         green_start = times['green_on']
-
-        # Print row
         print(
             f"{dev:<8}{distance:<10}{lane:<8}"
             f"{red_start:<10.2f}{orange_start:<12.2f}{green_start:<10.2f}"
         )
-
-    # Wait for user before returning
     input("\nPress ENTER to continue...")
-
 
 def enter_race_results(racers):
     """
@@ -549,25 +511,21 @@ def enter_race_results(racers):
         'start': float,
         'pb': float,
         'device': str,
-        'start_point': str,   # e.g. "100", "200", etc.
+        'start_point': str,
     }
     """
     from collections import defaultdict
 
     results = {}
-
-    # 1) Collect finish times or DLQs, grouped by start_point
+    # 1) Collect finish times or DLQs
     while True:
         clear_screen()
         print("\nEnter race results. Recorded times shown in brackets; 'DLQ' for disqualified.\n")
-
-        # Group athletes by their event
         grouped = defaultdict(list)
         for aid, data in racers.items():
             grp = data.get('start_point', 'Unknown')
             grouped[grp].append((aid, data))
 
-        # Display and build index→ID map
         index_map = {}
         idx = 1
         for grp in sorted(grouped):
@@ -586,14 +544,12 @@ def enter_race_results(racers):
         sel = input("Select athlete (number or ID), or press ENTER to finish: ").strip()
         if not sel:
             break
-
         aid = index_map.get(sel, sel.upper())
         if aid not in racers:
             print("❌ Invalid selection.")
             time.sleep(1)
             continue
 
-        # Prompt for finish time or DLQ
         while True:
             prompt = f"Enter finish time for {racers[aid]['name']} (seconds) or 'd' for DLQ: "
             entry = input(prompt).strip()
@@ -606,11 +562,11 @@ def enter_race_results(racers):
             except ValueError:
                 print("❌ Please enter a valid number of seconds or 'd'.")
 
-    # 2) Build flat list: (group, aid, start, finish, actual, new_pb)
+    # 2) Build flat list
     flat = []
     for aid, data in racers.items():
         start = data.get('start', 0.0)
-        finish = results.get(aid)           # either float or 'DLQ' or None
+        finish = results.get(aid)
         if finish == 'DLQ' or finish is None:
             actual = None
             new_pb = ''
@@ -620,41 +576,52 @@ def enter_race_results(racers):
         grp = data.get('start_point', 'Unknown')
         flat.append((grp, aid, data, start, finish, actual, new_pb))
 
-    # 3) Regroup by start_point
+    # 3) Regroup
     groups = defaultdict(list)
     for item in flat:
         groups[item[0]].append(item)
 
-    # 4) Display final results, sorting DLQs after real times
+    # 4) Display final results
     clear_screen()
     print("\n📊 Final Results by Event Group:\n")
-    header = f"{'Athlete ID':<12}{'Name':<20}{'Start(s)':<10}" \
-             f"{'Finish(s)':<12}{'Actual(s)':<12}{'New PB'}"
+    header = (
+        f"{'Athlete ID':<11}"
+        f"{'Name':<20}"
+        f"{'Prev PB(s)':<11}"
+        f"{'Start(s)':<10}"
+        f"{'Finish(s)':<11}"
+        f"{'Actual(s)':<11}"
+        f"{'New PB'}"
+    )
     sep = "-" * len(header)
 
     def sort_key(item):
-        # item[5] is actual; put None (DLQ) at end
         return item[5] if item[5] is not None else float('inf')
 
-    # print out the grid as before
     for grp in sorted(groups, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
         print(f"\n=== {grp}m ===")
         print(header)
         print(sep)
         for _, aid, data, start, finish, actual, new_pb in sorted(groups[grp], key=sort_key):
+            prev_pb = data.get('pb', 0.0)
             start_str = f"{start:<10.2f}"
             if finish == 'DLQ' or finish is None:
-                finish_str = f"{'DLQ':<12}"
-                actual_str = f"{'DLQ':<12}"
+                finish_str = f"{'DLQ':<11}"
+                actual_str = f"{'DLQ':<11}"
             else:
-                finish_str = f"{finish:<12.2f}"
-                actual_str = f"{actual:<12.2f}"
-            print(f"{aid:<12}{data['name']:<20}"
-                  f"{start_str}{finish_str}{actual_str}{new_pb}")
+                finish_str = f"{finish:<11.2f}"
+                actual_str = f"{actual:<11.2f}"
+            print(
+                f"{aid:<11}"
+                f"{data['name']:<20}"
+                f"{prev_pb:<11.2f}"
+                f"{start_str}"
+                f"{finish_str}"
+                f"{actual_str}"
+                f"{new_pb}"
+            )
 
-    # ─── New: Offer to save this session ─────────────────────────────────────
-    # First, flatten out the entries into a list we can write
-    import time, os, csv
+    # Offer to save session
     session_rows = []
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     for grp, entries in groups.items():
@@ -683,28 +650,17 @@ def enter_race_results(racers):
             w.writerows(session_rows)
         print("✅ Session saved to sessions.csv.")
 
-        # ─── New: Offer to update athletes PB file if there are new PBs ──────────
     has_new = any(row[7] == 'YES' for row in session_rows)
     if has_new:
         upd = input("New PBs detected. Update athletes.csv with new PBs? (y/n): ").strip().lower()
         if upd == 'y':
-            # 1) Update in-memory PBs from session_rows
             for timestamp, dist, aid, name, start_s, finish_s, actual_s, new_pb in session_rows:
                 if new_pb == 'YES' and actual_s != 'DLQ':
-                    try:
-                        athletes[aid]['pbs'][dist] = float(actual_s)
-                    except ValueError:
-                        # in case actual_s wasn't numeric, skip
-                        pass
-
-            # 2) Gather all distance columns (sorted numerically where possible)
+                    athletes[aid]['pbs'][dist] = float(actual_s)
             distances = sorted(
                 { d for ath in athletes.values() for d in ath['pbs'].keys() },
                 key=lambda x: float(x) if x.replace('.', '', 1).isdigit() else x
             )
-
-            # 3) Rewrite the athletes CSV using the updated dict
-            import csv
             with open(CSV_PATH, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['ID','Name'] + distances)
@@ -714,11 +670,9 @@ def enter_race_results(racers):
                         val = ath['pbs'].get(dist)
                         row.append(f"{val:.2f}" if isinstance(val, float) else '')
                     writer.writerow(row)
-
             print("✅ athletes.csv updated with new PBs.")
 
     input("\nPress ENTER to continue...")
-
 
 def setup_track():
     global devices
@@ -729,19 +683,19 @@ def setup_track():
             print("\nCurrent Start Points:")
             print(f"{'Distance':<10}{'Lane':<6}{'Device':<15}")
             print("-"*31)
-            for dist,sp in start_points.items():
+            for dist, sp in start_points.items():
                 if sp['has_lanes']:
-                    for lane in range(1,sp['num_lanes']+1):
-                        dev=sp['device_assignments'].get(f"Lane {lane}",'-')
+                    for lane in range(1, sp['num_lanes']+1):
+                        dev = sp['device_assignments'].get(f"Lane {lane}", '-')
                         print(f"{dist+'m':<10}{lane:<6}{dev:<15}")
                 else:
-                    devs=", ".join(sp['devices'])or'-'
+                    devs = ", ".join(sp['devices']) or '-'
                     print(f"{dist+'m':<10}{'--':<6}{devs:<15}")
         else:
             print("\nNo start points defined yet.")
         print("\nDiscovered Devices:")
         if devices:
-            sorted_devs=sorted(devices,key=lambda x:int(x))
+            sorted_devs = sorted(devices, key=lambda x:int(x))
             print(", ".join(sorted_devs))
         else:
             print("None")
@@ -751,31 +705,43 @@ def setup_track():
         print("4. Assign Devices")
         print("5. Test All Devices")
         print("Enter to go back to Main Menu")
-        choice=input("Select an option: ").strip()
-        if choice=='1': define_start_points()
-        elif choice=='2': devices=send_all_reset_and_listen()
-        elif choice=='3': devices=add_virtual_devices()
-        elif choice=='4':
-            for sp in start_points.values(): sp['device_assignments'].clear(); sp['devices'].clear()
+        choice = input("Select an option: ").strip()
+        if choice == '1':
+            define_start_points()
+        elif choice == '2':
+            devices = send_all_reset_and_listen()
+        elif choice == '3':
+            devices = add_virtual_devices()
+        elif choice == '4':
+            for sp in start_points.values():
+                sp['device_assignments'].clear()
+                sp['devices'].clear()
             print(f"\nDevices to assign: {devices}")
-            for dist,sp in start_points.items():
+            for dist, sp in start_points.items():
                 print(f"\nAssigning devices for {dist}m:")
                 if sp['has_lanes']:
-                    for lane in range(1,sp['num_lanes']+1):
-                        dev=input(f"  Device for lane {lane} (Enter to skip): ").strip()
-                        if dev and dev in devices: sp['device_assignments'][f"Lane {lane}"]=dev
-                        elif dev: print("❌ Invalid device ID.")
+                    for lane in range(1, sp['num_lanes']+1):
+                        dev = input(f"  Device for lane {lane} (Enter to skip): ").strip()
+                        if dev and dev in devices:
+                            sp['device_assignments'][f"Lane {lane}"] = dev
+                        elif dev:
+                            print("❌ Invalid device ID.")
                 else:
                     while True:
-                        dev=input("  Device (Enter to stop): ").strip()
-                        if not dev: break
-                        if dev in devices: sp['devices'].append(dev)
-                        else: print("❌ Invalid device ID.")
+                        dev = input("  Device (Enter to stop): ").strip()
+                        if not dev:
+                            break
+                        if dev in devices:
+                            sp['devices'].append(dev)
+                        else:
+                            print("❌ Invalid device ID.")
             input("Press ENTER to continue...")
-        elif choice=='5': test_all_devices()
-        elif choice=='': break
-        else: input("Press ENTER to continue...")
-
+        elif choice == '5':
+            test_all_devices()
+        elif choice == '':
+            break
+        else:
+            input("Press ENTER to continue...")
 
 def main():
     global athletes, racers
@@ -791,17 +757,27 @@ def main():
         print("5. Start Race")
         print("6. Enter Results")
         print("Enter to Exit")
-        choice=input("Select: ").strip()
-        if choice=='1': setup_track()
-        elif choice=='2':
-            racers=get_race_participants(athletes,start_points)
-            if racers: distance=input("Hit Enter to continue").strip(); calculate_staggered_starts(racers,distance)
-        elif choice=='3': calculate_timings(racers)
-        elif choice=='4': show_device_schedule(racers)
-        elif choice=='5': start_race_sequence(racers)
-        elif choice=='6': enter_race_results(racers)
-        elif choice=='': break
-        else: print("❌ Invalid choice."); input("\nPress ENTER to continue...")
+        choice = input("Select: ").strip()
+        if choice == '1':
+            setup_track()
+        elif choice == '2':
+            racers = get_race_participants(athletes, start_points)
+            if racers:
+                distance = input("Hit Enter to continue").strip()
+                calculate_staggered_starts(racers, distance)
+        elif choice == '3':
+            calculate_timings(racers)
+        elif choice == '4':
+            show_device_schedule(racers)
+        elif choice == '5':
+            start_race_sequence(racers)
+        elif choice == '6':
+            enter_race_results(racers)
+        elif choice == '':
+            break
+        else:
+            print("❌ Invalid choice.")
+            input("\nPress ENTER to continue...")
 
 if __name__ == '__main__':
     try:
