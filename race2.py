@@ -233,18 +233,194 @@ def load_athletes(file_path=CSV_PATH):
             athletes[aid] = {"name": name, "pbs": pbs}
     return athletes
 
+def get_csv_distances(file_path=CSV_PATH):
+    """Return the header distances (excluding ID, Name) in athletes.csv."""
+    with open(file_path, newline='') as f:
+        reader = csv.reader(f)
+        header = next(reader, None) or []
+    return [h for h in header if h not in ('ID', 'Name')]
+
+def search_athletes(athletes_dict, query):
+    """Return list of (aid, name) where name contains query (case-insensitive)."""
+    q = query.strip().lower()
+    if not q:
+        return []
+    hits = []
+    for aid, info in athletes_dict.items():
+        if q in (info.get('name') or '').lower():
+            hits.append((aid, info['name']))
+    hits.sort(key=lambda x: x[1].lower())
+    return hits
+
+def search_athletes_prompt(athletes_dict, initial_query=None):
+    """
+    Interactive search picker. Returns chosen athlete ID or None.
+    - initial_query: if provided, starts with that; otherwise asks.
+    """
+    q = initial_query
+    while True:
+        if not q:
+            q = input("Search name (blank to cancel): ").strip()
+            if not q:
+                return None
+        matches = search_athletes(athletes_dict, q)
+        if not matches:
+            print("🔎 No matches. Try another search.")
+            q = None
+            continue
+        print("\nMatches:")
+        for i, (aid, name) in enumerate(matches, 1):
+            print(f"  {i}. {name}  [{aid}]")
+        sel = input("Pick number, or type new search, or ENTER to cancel: ").strip()
+        if sel == "":
+            return None
+        if sel.isdigit():
+            n = int(sel)
+            if 1 <= n <= len(matches):
+                return matches[n-1][0]
+            else:
+                print("❌ Out of range.")
+                continue
+        # treat as a new search string
+        q = sel
+
+def add_athlete_interactive(athletes_dict, file_path=CSV_PATH):
+    """
+    Prompt to add a new athlete. Appends to CSV and updates athletes_dict.
+    Returns new athlete ID on success, else None.
+    """
+    clear_screen()
+    print("➕ Add New Athlete\n")
+    distances = get_csv_distances(file_path)
+
+    # ID
+    while True:
+        aid = input("New Athlete ID (e.g. A12, must be unique): ").strip().upper()
+        if not aid:
+            print("⚠️  Cancelled.")
+            input("Press ENTER to continue…")
+            return None
+        if aid in athletes_dict:
+            print("❌ That ID already exists.")
+            continue
+        break
+
+    # Name
+    name = input("Athlete Name: ").strip()
+    if not name:
+        print("❌ Name cannot be blank.")
+        input("Press ENTER to continue…")
+        return None
+
+    # PBs
+    new_pbs = {}
+    if not distances:
+        print("ℹ️  No distance columns in CSV header yet. You can add PBs later via race results.")
+    else:
+        print("\nEnter PBs (seconds) for any of these distances; leave blank to skip.")
+        print("Available:", ", ".join(distances))
+        for d in distances:
+            s = input(f"  {d} PB (s): ").strip()
+            if not s:
+                continue
+            try:
+                new_pbs[d] = float(s)
+            except ValueError:
+                print("   ⚠️ Not a number, skipped.")
+
+    # Append to CSV respecting the current header
+    try:
+        with open(file_path, newline='') as f:
+            reader = csv.reader(f)
+            header = next(reader, None) or ['ID', 'Name']
+    except FileNotFoundError:
+        header = ['ID', 'Name'] + sorted(new_pbs.keys(), key=lambda x: float(x) if x.replace('.','',1).isdigit() else x)
+        # create file with header
+        with open(file_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
+    # Ensure header has all keys we plan to write
+    hdr_set = set(header)
+    need_cols = {'ID','Name'} | set(new_pbs.keys())
+    if not need_cols.issubset(hdr_set):
+        # extend header and rewrite entire CSV to include new columns
+        extra = list(need_cols - hdr_set)
+        header = header + extra
+        # read existing rows
+        try:
+            with open(file_path, newline='') as f:
+                rows = list(csv.reader(f))
+        except FileNotFoundError:
+            rows = []
+        # rewrite with extended header
+        with open(file_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            # write old data (skip previous header if present)
+            for row in rows[1:] if rows and rows[0] and rows[0][0] == 'ID' else rows:
+                # pad/truncate to new header length
+                row_map = dict(zip(rows[0], row)) if rows else {}
+                out = []
+                for col in header:
+                    if col in ('ID','Name'):
+                        out.append(row_map.get(col, ''))
+                    else:
+                        out.append(row_map.get(col, ''))
+                w.writerow(out)
+
+    # now append the new athlete line
+    with open(file_path, 'a', newline='') as f:
+        w = csv.writer(f)
+        row = []
+        for col in header:
+            if col == 'ID':
+                row.append(aid)
+            elif col == 'Name':
+                row.append(name)
+            else:
+                val = new_pbs.get(col)
+                row.append(f"{val:.2f}" if isinstance(val, float) else '')
+        w.writerow(row)
+
+    # update in-memory
+    athletes_dict[aid] = {"name": name, "pbs": new_pbs}
+    print(f"\n✅ Added {name} [{aid}]")
+    input("Press ENTER to continue…")
+    return aid
+
 def get_race_participants(athletes, start_points):
+    """
+    Enter IDs into lanes; supports:
+      - '?query' to search by name
+      - '+' to add a new athlete on the spot
+    """
     racers = {}
     for dist, sp in start_points.items():
         print(f"Setting up race for {dist}m:")
         if sp["has_lanes"]:
             for lane in range(1, sp["num_lanes"] + 1):
                 while True:
-                    aid = input(f"  Lane {lane} Athlete ID (Enter to skip): ").strip().upper()
-                    if aid == "":
+                    aid_in = input(f"  Lane {lane} Athlete ID (Enter to skip, '?name' to search, '+' to add): ").strip()
+                    if aid_in == "":
                         break
+                    if aid_in.startswith("?"):
+                        picked = search_athletes_prompt(athletes, aid_in[1:])
+                        if picked:
+                            aid_in = picked
+                        else:
+                            continue
+                    if aid_in == "+":
+                        new_id = add_athlete_interactive(athletes)
+                        if not new_id:
+                            continue
+                        aid_in = new_id
+                    aid = aid_in.upper()
                     if aid not in athletes:
                         print("❌ ID not found.")
+                        continue
+                    if aid in racers:
+                        print("⚠️ Already added.")
                         continue
                     racers[aid] = {
                         "name": athletes[aid]["name"],
@@ -254,11 +430,23 @@ def get_race_participants(athletes, start_points):
                     sp["assignments"][f"Lane {lane}"] = aid
                     break
         else:
-            print("  Enter athletes for this start point (press Enter to finish):")
+            print("  Enter athletes for this start point (press Enter to finish).")
             while True:
-                aid = input("  Athlete ID: ").strip().upper()
-                if aid == "":
+                aid_in = input("  Athlete ID ('?name' to search, '+' to add): ").strip()
+                if aid_in == "":
                     break
+                if aid_in.startswith("?"):
+                    picked = search_athletes_prompt(athletes, aid_in[1:])
+                    if picked:
+                        aid_in = picked
+                    else:
+                        continue
+                if aid_in == "+":
+                    new_id = add_athlete_interactive(athletes)
+                    if not new_id:
+                        continue
+                    aid_in = new_id
+                aid = aid_in.upper()
                 if aid not in athletes:
                     print("❌ ID not found.")
                     continue
@@ -440,7 +628,6 @@ def calculate_timings(racers):
                 racers[aid]['start'] = row['start']
                 racers[aid]['pb'] = row['pb']
                 # Map device by current lane assignment
-                # Find which lane currently holds this athlete
                 assigned_lane = None
                 for ln, a in sp['assignments'].items():
                     if a == aid:
@@ -861,42 +1048,31 @@ def _apply_lane_pattern_for_distance(racers, distance, pattern):
             print(f"{lane_key:<8}{'-':<8}{'-':<12}{'-':<20}{'-':<8}{'-':<12}")
     input("\nPress ENTER to continue…")
 
-# ───────────────────────── New Devices menu ─────────────────────────
+# ───────────────────────── Athletes menu ─────────────────────────
 
-def devices_menu():
-    global devices
+def athletes_menu():
     while True:
         clear_screen()
-        print("=== Devices ===")
-        print("\nCurrent devices:", ", ".join(sorted(devices, key=lambda x:int(x))) if devices else "(none)")
-        print("\n1. Discover (DISCOVER)")
-        print("2. Flash test (FLASH)")
-        print("3. Set default volume")
-        print("4. Set per-device volumes")
-        print("5. Show volume settings")
-        print("6. Add virtual devices (for bench)")
+        print("=== Athletes ===")
+        print("1. Search by name")
+        print("2. Add new athlete")
         print("Enter to go back")
-        choice = input("Select: ").strip()
-        if choice == '1':
-            found = discover_devices(timeout=2)
-            if found:
-                # merge into devices, avoid duplicates
-                for d in found:
-                    if d not in devices:
-                        devices.append(d)
-            input("Press ENTER to continue…")
-        elif choice == '2':
-            flash_all_devices(timeout=2)
-            input("Press ENTER to continue…")
-        elif choice == '3':
-            set_default_volume_interactive()
-        elif choice == '4':
-            set_per_device_volumes()
-        elif choice == '5':
-            list_volumes()
-        elif choice == '6':
-            add_virtual_devices()
-        elif choice == '':
+        ch = input("Select: ").strip()
+        if ch == '1':
+            q = input("Type part of a name: ").strip()
+            if not q:
+                continue
+            hits = search_athletes(athletes, q)
+            if not hits:
+                print("No matches.")
+            else:
+                print("\nMatches:")
+                for aid, name in hits:
+                    print(f"  {name}  [{aid}]")
+            input("\nPress ENTER to continue…")
+        elif ch == '2':
+            add_athlete_interactive(athletes, CSV_PATH)
+        elif ch == '':
             break
         else:
             input("Press ENTER to continue...")
@@ -984,6 +1160,7 @@ def main():
         print("5. Show Execution Times")
         print("6. Start Race")
         print("7. Enter Results")
+        print("8. Athletes")
         print("Enter to Exit")
         choice = input("Select: ").strip()
 
@@ -1017,6 +1194,8 @@ def main():
             start_race_sequence(racers)
         elif choice == '7':
             enter_race_results(racers)
+        elif choice == '8':
+            athletes_menu()
         elif choice == '':
             # Confirm exit
             while True:
