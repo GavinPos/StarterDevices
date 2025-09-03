@@ -81,7 +81,7 @@ def discover_devices(timeout=2):
                 continue
             if line.startswith("CHECK "):
                 parts = line.split()
-                if len(parts) >= 3 and parts[2].upper() == "ACKed".upper():
+                if len(parts) >= 3 and parts[2].upper() == "ACKED":
                     addr = parts[1]
                     dev_id = addr[-2:]
                     discovered.add(dev_id)
@@ -436,9 +436,17 @@ def calculate_timings(racers):
         if sp['has_lanes']:
             for row in rows:
                 aid = row['id']
+                # Preserve any lane reassignment; just refresh derived fields
                 racers[aid]['start'] = row['start']
-                racers[aid]['device'] = sp['device_assignments'].get(row['lane'], '-')
                 racers[aid]['pb'] = row['pb']
+                # Map device by current lane assignment
+                # Find which lane currently holds this athlete
+                assigned_lane = None
+                for ln, a in sp['assignments'].items():
+                    if a == aid:
+                        assigned_lane = ln
+                        break
+                racers[aid]['device'] = sp['device_assignments'].get(assigned_lane, '-')
         else:
             default_dev = sp['devices'][0] if sp['devices'] else '-'
             for row in rows:
@@ -763,6 +771,96 @@ def enter_race_results(racers):
 
     input("\nPress ENTER to continue...")
 
+# ───────────────────────── Handicap lane helpers ─────────────────────────
+
+def _sorted_aids_by_handicap(racers, aids):
+    """
+    Return athlete IDs sorted slowest→fastest by their computed 'start'.
+    (start = slowest_pb - pb, so slowest has 0, faster have larger positive starts)
+    Tie-break by larger PB first (slower), then name.
+    """
+    return sorted(
+        aids,
+        key=lambda aid: (racers.get(aid, {}).get('start', 0.0),
+                         -racers.get(aid, {}).get('pb', 0.0),
+                         racers.get(aid, {}).get('name', ''))
+    )
+
+def _lane_order_snake(num_lanes):
+    """
+    1, N, 2, N-1, 3, N-2, ... (works for any lane count)
+    """
+    order = []
+    left, right = 1, num_lanes
+    while left <= right:
+        order.append(f"Lane {left}")
+        if right != left:
+            order.append(f"Lane {right}")
+        left += 1
+        right -= 1
+    return order
+
+def _apply_lane_pattern_for_distance(racers, distance, pattern):
+    """
+    pattern:
+      'outside_in' → slowest on the OUTSIDE lanes (highest numbers), then inward.
+      'inside_out' → SNAKE: slowest L1, next LN, then L2, LN-1, … toward middle.
+    Rewrites start_points[distance]['assignments'] and updates racers' device mapping.
+    Displays the new plan.
+    """
+    sp = start_points.get(distance)
+    if not sp or not sp.get('has_lanes'):
+        print(f"ℹ️  {distance}m has no lanes (nothing to rearrange).")
+        input("Press ENTER to continue…"); return
+
+    num = sp['num_lanes']
+    # Current lane → athlete ids that actually exist in racers
+    current_pairs = [(ln, sp['assignments'].get(f"Lane {ln}")) for ln in range(1, num+1)]
+    aids = [aid for _, aid in current_pairs if aid and aid in racers]
+    if not aids:
+        print("⚠️  No lane assignments yet for this distance.")
+        input("Press ENTER to continue…"); return
+
+    ordered_aids = _sorted_aids_by_handicap(racers, aids)  # slowest→fastest
+
+    if pattern == 'outside_in':
+        lane_order = [f"Lane {ln}" for ln in range(num, 0, -1)]         # N..1
+        title = "Outside → Inside"
+    else:  # 'inside_out' is the requested snake pattern
+        lane_order = _lane_order_snake(num)                              # 1,N,2,N-1,...
+        title = "Snake: 1, N, 2, N-1, …"
+
+    # Build new lane→athlete map following the chosen order
+    new_assign = {}
+    for i, aid in enumerate(ordered_aids):
+        if i < len(lane_order):
+            new_assign[lane_order[i]] = aid
+    sp['assignments'] = new_assign  # replace
+
+    # Update racers' device field so scheduling uses the new lanes/devices
+    for lane_key, aid in sp['assignments'].items():
+        dev = sp['device_assignments'].get(lane_key, '-')
+        if aid in racers:
+            racers[aid]['device'] = dev
+
+    # Show the plan (print lanes in natural ascending order for readability)
+    clear_screen()
+    print(f"🏟️  Handicap Lane Plan — {distance}m ({title})\n")
+    print(f"{'Lane':<8}{'Device':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Headstart(s)':<12}")
+    print("-"*68)
+    for ln in range(1, num+1):
+        lane_key = f"Lane {ln}"
+        aid = sp['assignments'].get(lane_key, '')
+        dev = sp['device_assignments'].get(lane_key, '-')
+        if aid:
+            r  = racers[aid]
+            pb = r.get('pb', 0.0)
+            st = r.get('start', 0.0)
+            print(f"{lane_key:<8}{dev:<8}{aid:<12}{r['name']:<20}{pb:<8.2f}{st:<12.2f}")
+        else:
+            print(f"{lane_key:<8}{'-':<8}{'-':<12}{'-':<20}{'-':<8}{'-':<12}")
+    input("\nPress ENTER to continue…")
+
 # ───────────────────────── New Devices menu ─────────────────────────
 
 def devices_menu():
@@ -900,6 +998,17 @@ def main():
                 distance = input("Distance for handicap calc (e.g. 100): ").strip()
                 if distance:
                     calculate_staggered_starts(racers, distance)
+
+                    # Choose lane pattern
+                    print("\nHandicap lane pattern:")
+                    print("  1) Slowest on OUTSIDE lanes (devices fire outside → inside)")
+                    print("  2) Slowest L1, next LN, then L2, LN-1, … (snake across)")
+                    print("  Enter to skip (keep current lanes)")
+                    pat = input("Select: ").strip()
+                    if pat == '1':
+                        _apply_lane_pattern_for_distance(racers, distance, 'outside_in')
+                    elif pat == '2':
+                        _apply_lane_pattern_for_distance(racers, distance, 'inside_out')
         elif choice == '4':
             calculate_timings(racers)
         elif choice == '5':
