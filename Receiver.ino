@@ -3,7 +3,7 @@
 #include <DFRobotDFPlayerMini.h>
 
 RF24 radio(9, 10);  // CE, CSN
-static const byte thisDeviceAddr[6] = "DEV02";
+static const byte thisDeviceAddr[6] = "DEV03";
 
 // ---------- LED pins ----------
 const int RED_LED    = 5;
@@ -27,10 +27,11 @@ const uint16_t STARTUP_SOUND_MS = 500;  // 0 = skip startup tone
 const uint8_t TRACK_RED    = 1;
 const uint8_t TRACK_ORANGE = 2;
 const uint8_t TRACK_GREEN  = 3;
-const uint8_t TRACK_FOR_STEP[3] = { TRACK_RED, TRACK_ORANGE, TRACK_GREEN };
+const uint8_t TRACK_START  = 4;
+const uint8_t TRACK_FOR_STEP[4] = { TRACK_RED, TRACK_ORANGE, TRACK_GREEN, TRACK_START };
 
 // Audio lead (ms) BEFORE each LED so sound starts slightly early
-const uint16_t LEAD_T_MS[3] = { 120, 120, 120 };  // tune per light
+const uint16_t LEAD_T_MS[3] = { 1000, 1000, 1000 };  // tune per light
 
 // ---------- Dedupe state for ST2 ----------
 uint16_t lastSeq = 0;
@@ -58,8 +59,7 @@ static inline void sortActionsByTime() {
 // ---------- Fwds ----------
 void allLedsOff();
 void flashLights();
-void parseAndScheduleSequence(const char* data);     // legacy
-void parseAndScheduleSequenceV2(const char* data);   // ST2
+void parseAndScheduleSequence(const char* data);   // ST2
 void runScheduledSteps();
 void executeStep(int idx);
 static inline void preloadAckReady(uint16_t seq);
@@ -80,13 +80,16 @@ void setup() {
 
   // DFPlayer init
   if (dfplayer.begin(Serial)) {
-    dfplayer.volume(0);
-    dfplayer.stop();
+    delay(800);                             // <-- important on many clones
+	dfplayer.outputDevice(DFPLAYER_DEVICE_SD);
+	dfplayer.EQ(DFPLAYER_EQ_NORMAL);
+	dfplayer.stop();
+	dfplayer.volume(0);
 							
 							   
     if (STARTUP_SOUND_MS > 0) {
       dfplayer.volume(START_VOL);
-      dfplayer.play(TRACK_GREEN);      // or any track you want on boot
+      dfplayer.playMp3Folder(TRACK_START);      // or any track you want on boot
       delay(STARTUP_SOUND_MS);
       dfplayer.stop();
       dfplayer.volume(0);
@@ -146,12 +149,7 @@ void loop() {
       }
     }
     else if (strncmp(msg, "ST2:", 4) == 0) {
-      parseAndScheduleSequenceV2(msg + 4);      // preloads RDY:<seq>
-																	   
-														   
-	 
-										
-										
+      parseAndScheduleSequence(msg + 4);      // preloads RDY:<seq>
     }
     else if (strncmp(msg, "PING:", 5) == 0) {
       // READY ack payload was preloaded in ST2 parser
@@ -168,34 +166,8 @@ void loop() {
   runScheduledSteps();
 }
 
-						  
-												 
-				   
-				
-
-				
-									
-								
-
-									   
-							   
-																						  
-
-								   
-								
-																		   
-
-								  
-																						   
-
-													 
-																									   
-									  
-							 
- 
-
 // ---------- ST2 parser with dedupe + READY ack preload ----------
-void parseAndScheduleSequenceV2(const char* data) {
+void parseAndScheduleSequence(const char* data) {
   // data = "<seq>|<t0|t1|t2|t3>:<masterStart>:<vol>"
   char temp[80];
   strncpy(temp, data, sizeof(temp));
@@ -308,14 +280,12 @@ void executeStep(int idx) {
 static inline void audioDisarm(){ dfplayer.volume(0); dfplayer.stop(); }
 
 void playSoft(uint8_t track, uint8_t targetVol) {
+  // Non-blocking: set volume instantly and start playback, then return.
   targetVol = constrain(targetVol, 0, 30);
-  dfplayer.volume(0);
-  dfplayer.play(track);
-  delay(50);                           // let DFPlayer bias
-  for (uint8_t v = 0; v <= targetVol; v += 2) {
-    dfplayer.volume(v);
-    delay(8);
-  }
+  dfplayer.stop();                 // optional: ensure clean start
+  dfplayer.volume(targetVol);      // set final volume immediately
+  dfplayer.playMp3Folder(track);            // start playback
+  // no delay(), no loops — returns immediately so scheduling stays precise
 }
 
 void flashLights(){
