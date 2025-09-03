@@ -1183,9 +1183,144 @@ def devices_menu():
         else:
             input("Press ENTER to continue...")
 
+def override_start_delays(racers):
+    """
+    Let the user override 'start' (headstart) values after Calculate Timings.
+    You can:
+      • Select an athlete (by number or ID) and set an absolute start (seconds)
+      • Type:  all <±delta>     → add/subtract a delta to ALL starts (e.g. 'all +0.20')
+      • Type:  dist <D> <±delta>→ add/subtract a delta to one distance group (e.g. 'dist 100 +0.10')
+      • Press ENTER to finish
+    """
+    from collections import defaultdict
+
+    if not racers:
+        print("ℹ️  No racers loaded. Setup race first.")
+        input("Press ENTER to continue…")
+        return
+
+    while True:
+        clear_screen()
+        # Build a stable, grouped listing by distance and lane
+        grouped = defaultdict(list)  # dist -> list of (lane_key, aid)
+        for dist, sp in start_points.items():
+            if not sp.get("assignments"):
+                continue
+            if sp.get("has_lanes"):
+                for ln in range(1, sp["num_lanes"] + 1):
+                    lane_key = f"Lane {ln}"
+                    aid = sp["assignments"].get(lane_key)
+                    if aid and aid in racers and racers[aid].get("start_point") == dist:
+                        grouped[dist].append((lane_key, aid))
+            else:
+                # non-laned start point
+                for aid in sp["assignments"].values():
+                    if aid and aid in racers and racers[aid].get("start_point") == dist:
+                        grouped[dist].append(("-", aid))
+
+        # Build flat index list for selection
+        index = []
+        print("✏️  Override Start Delays\n")
+        print("Instructions:")
+        print("  • Pick athlete by NUMBER or ID to set an absolute start (seconds)")
+        print("  • Or type:  all <±delta>        (e.g. all +0.20)")
+        print("  • Or type:  dist <D> <±delta>   (e.g. dist 100 +0.10)")
+        print("  • ENTER to finish\n")
+
+        row_no = 1
+        for dist in sorted(grouped, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
+            print(f"=== {dist}m ===")
+            print(f"{'#':<3}{'Lane':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Start(s)':<10}")
+            print("-" * 61)
+            for lane_key, aid in grouped[dist]:
+                r = racers[aid]
+                pb = r.get('pb', 0.0)
+                st = r.get('start', 0.0)
+                print(f"{row_no:<3}{lane_key:<8}{aid:<12}{r['name']:<20}{pb:<8.2f}{st:<10.2f}")
+                index.append((row_no, dist, lane_key, aid))
+                row_no += 1
+            print()
+
+        # Prompt
+        sel = input("Select # or ID (or 'all +/-x.xx' / 'dist D +/-x.xx', ENTER to finish): ").strip()
+        if sel == "":
+            break
+
+        # Handle 'all <delta>'
+        parts = sel.split()
+        if len(parts) == 2 and parts[0].lower() == "all":
+            try:
+                delta = float(parts[1])
+            except ValueError:
+                print("❌ Could not parse delta.")
+                time.sleep(0.8)
+                continue
+            for _, _, _, aid in index:
+                racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
+            print(f"✅ Applied {delta:+.2f}s to ALL starts.")
+            time.sleep(0.8)
+            continue
+
+        # Handle 'dist <D> <delta>'
+        if len(parts) == 3 and parts[0].lower() == "dist":
+            dist_key = parts[1]
+            try:
+                delta = float(parts[2])
+            except ValueError:
+                print("❌ Could not parse delta.")
+                time.sleep(0.8)
+                continue
+            # apply to only that distance
+            applied = 0
+            for _, d, _, aid in index:
+                if d == dist_key:
+                    racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
+                    applied += 1
+            if applied:
+                print(f"✅ Applied {delta:+.2f}s to {applied} athlete(s) in {dist_key}m.")
+            else:
+                print(f"⚠️  No athletes found for distance '{dist_key}'.")
+            time.sleep(0.8)
+            continue
+
+        # Individual edit by number or ID
+        # Resolve # → aid
+        aid_to_edit = None
+        if sel.isdigit():
+            num = int(sel)
+            match = next((t for t in index if t[0] == num), None)
+            if match:
+                aid_to_edit = match[3]
+        else:
+            # assume it's an ID
+            cand = sel.upper()
+            if cand in racers:
+                aid_to_edit = cand
+
+        if not aid_to_edit:
+            print("❌ Not a valid selection.")
+            time.sleep(0.8)
+            continue
+
+        # Prompt new absolute start
+        current = racers[aid_to_edit].get('start', 0.0)
+        prompt = f"New absolute start for {aid_to_edit} ({racers[aid_to_edit]['name']}) [current {current:.2f}s]: "
+        val = input(prompt).strip()
+        if val == "":
+            continue
+        try:
+            new_start = float(val)
+        except ValueError:
+            print("❌ Please enter a number (e.g. 1.25 or -0.30).")
+            time.sleep(0.8)
+            continue
+
+        racers[aid_to_edit]['start'] = new_start
+        print(f"✅ Updated {aid_to_edit} → {new_start:.2f}s")
+        time.sleep(0.8)
+
 
 # ───────────────────────── Main ─────────────────────────
-
 def main():
     global athletes, racers
     athletes = load_athletes()
@@ -1227,7 +1362,8 @@ def main():
                     elif pat == '2':
                         _apply_lane_pattern_for_distance(racers, distance, 'inside_out')
         elif choice == '4':
-            calculate_timings(racers)
+                calculate_timings(racers)
+                override_start_delays(racers)
         elif choice == '5':
             show_device_schedule(racers)
         elif choice == '6':
