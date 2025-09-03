@@ -1144,6 +1144,46 @@ def setup_track():
         else:
             input("Press ENTER to continue...")
 
+# ───────────────────────── Devices menu ─────────────────────────
+def devices_menu():
+    global devices
+    while True:
+        clear_screen()
+        print("=== Devices ===")
+        print("\nCurrent devices:", ", ".join(sorted(devices, key=lambda x: int(x))) if devices else "(none)")
+        print("\n1. Discover (DISCOVER)")
+        print("2. Flash test (FLASH)")
+        print("3. Set default volume")
+        print("4. Set per-device volumes")
+        print("5. Show volume settings")
+        print("6. Add virtual devices (for bench)")
+        print("Enter to go back")
+        choice = input("Select: ").strip()
+        if choice == '1':
+            found = discover_devices(timeout=2)
+            if found:
+                # merge new finds into devices
+                for d in found:
+                    if d not in devices:
+                        devices.append(d)
+            input("Press ENTER to continue…")
+        elif choice == '2':
+            flash_all_devices(timeout=2)
+            input("Press ENTER to continue…")
+        elif choice == '3':
+            set_default_volume_interactive()
+        elif choice == '4':
+            set_per_device_volumes()
+        elif choice == '5':
+            list_volumes()
+        elif choice == '6':
+            add_virtual_devices()
+        elif choice == '':
+            break
+        else:
+            input("Press ENTER to continue...")
+
+
 # ───────────────────────── Main ─────────────────────────
 
 def main():
