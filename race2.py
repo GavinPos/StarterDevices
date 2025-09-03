@@ -888,6 +888,7 @@ def main():
         print("7. Enter Results")
         print("Enter to Exit")
         choice = input("Select: ").strip()
+
         if choice == '1':
             devices_menu()
         elif choice == '2':
@@ -908,7 +909,16 @@ def main():
         elif choice == '7':
             enter_race_results(racers)
         elif choice == '':
-            break
+            # Confirm exit
+            while True:
+                ans = input("Are you sure you want to exit? (y/n): ").strip().lower()
+                if ans == 'y':
+                    return  # triggers the finally: ser.close()
+                elif ans == 'n' or ans == '':
+                    break    # back to the main menu
+                else:
+                    print("Please answer 'y' or 'n'.")
+                    time.sleep(0.6)
         else:
             print("❌ Invalid choice.")
             input("\nPress ENTER to continue...")
