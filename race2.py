@@ -6,7 +6,7 @@ import serial.tools.list_ports
 import socket
 
 CSV_PATH = "data/athletes.csv"
-CSV_PATH2 = "data/athletes2.csv"
+CSV_PATH2 = "data/athletes2.csv"   # kept for compatibility; not required
 SESSION_FILE = "data/sessions.csv"
 SERIAL_PORT = None
 BAUD_RATE = 115200
@@ -19,10 +19,9 @@ start_points = {}
 athletes = {}
 ser = None
 
-# NEW: volume management
+# Volume management
 default_volume = None        # None or int 0..30
 device_volumes = {}          # {'03': 18, '07': 25, ...}
-
 
 # ───────────────────────── Serial helpers ─────────────────────────
 
@@ -157,11 +156,9 @@ def set_default_volume_interactive():
             continue
         default_volume = nv
         print(f"✅ Default volume set to {default_volume} (will be sent in START blocks).")
-        # Optional: also tell transmitter now (useful for immediate tests)
         choice = input("Send 'VOLUME' to transmitter now too? (y/n): ").strip().lower()
         if choice == 'y':
             _send_line(f"VOLUME:{default_volume}")
-            # read a short response burst without blocking the UI too long
             t0 = time.time()
             while time.time() - t0 < 0.5 and ser.in_waiting > 0:
                 msg = ser.readline().decode("utf-8", errors="ignore").strip()
@@ -206,7 +203,7 @@ def list_volumes():
         print("   (none)")
     input("\nPress ENTER to continue…")
 
-# ───────────────────────── Athletes & timing ─────────────────────────
+# ───────────────────────── Athletes load/save/search ─────────────────────────
 
 def load_athletes(file_path=CSV_PATH):
     """
@@ -216,246 +213,232 @@ def load_athletes(file_path=CSV_PATH):
       { athlete_id: { "name": str, "pbs": { distance: float, ... } } }
     """
     athletes = {}
+    if not os.path.exists(file_path):
+        return athletes
     with open(file_path, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            aid = row['ID']
-            name = row['Name']
+            aid = row.get('ID', '').strip().upper()
+            if not aid:
+                continue
+            name = row.get('Name', '').strip()
             pbs = {}
             for col, val in row.items():
                 if col in ('ID', 'Name'):
                     continue
-                if val.strip():
+                if val is None:
+                    continue
+                sval = str(val).strip()
+                if sval:
                     try:
-                        pbs[col] = float(val)
+                        pbs[col] = float(sval)
                     except ValueError:
-                        print(f"⚠️  Skipping non-numeric PB for athlete {aid}: {col}='{val}'")
-            athletes[aid] = {"name": name, "pbs": pbs}
+                        # keep reading, just skip bad cell
+                        pass
+            athletes[aid] = {"name": name or aid, "pbs": pbs}
     return athletes
 
-def get_csv_distances(file_path=CSV_PATH):
-    """Return the header distances (excluding ID, Name) in athletes.csv."""
-    with open(file_path, newline='') as f:
-        reader = csv.reader(f)
-        header = next(reader, None) or []
-    return [h for h in header if h not in ('ID', 'Name')]
+def write_athletes_csv(athletes_dict, file_path=CSV_PATH):
+    """Rewrite athletes.csv with a unified set of distance columns."""
+    distances = sorted(
+        {d for a in athletes_dict.values() for d in a["pbs"].keys()},
+        key=lambda x: float(x) if x.replace('.', '', 1).isdigit() else x
+    )
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ID', 'Name'] + distances)
+        for aid in sorted(athletes_dict.keys()):
+            ath = athletes_dict[aid]
+            row = [aid, ath['name']]
+            for dist in distances:
+                val = ath['pbs'].get(dist)
+                row.append(f"{val:.2f}" if isinstance(val, (int, float)) else '')
+            w.writerow(row)
 
-def search_athletes(athletes_dict, query):
-    """Return list of (aid, name) where name contains query (case-insensitive)."""
+def search_athletes_by_name(query, limit=20):
+    """Return [(aid, name)] whose name contains query (case-insensitive)."""
     q = query.strip().lower()
-    if not q:
-        return []
-    hits = []
-    for aid, info in athletes_dict.items():
-        if q in (info.get('name') or '').lower():
-            hits.append((aid, info['name']))
-    hits.sort(key=lambda x: x[1].lower())
-    return hits
+    out = []
+    for aid, info in athletes.items():
+        if q in info["name"].lower():
+            out.append((aid, info["name"]))
+    out.sort(key=lambda t: t[1].lower())
+    return out[:limit]
 
-def search_athletes_prompt(athletes_dict, initial_query=None):
+def add_new_athlete_interactive():
     """
-    Interactive search picker. Returns chosen athlete ID or None.
-    - initial_query: if provided, starts with that; otherwise asks.
+    Add a new athlete. PB input:
+      • number like 12.34 → PB in seconds
+      • '?'  → set THIS distance to 999
+      • '??' → set THIS and ALL REMAINING distances to 999
+      • ''   → leave blank
     """
-    q = initial_query
-    while True:
-        if not q:
-            q = input("Search name (blank to cancel): ").strip()
-            if not q:
-                return None
-        matches = search_athletes(athletes_dict, q)
-        if not matches:
-            print("🔎 No matches. Try another search.")
-            q = None
-            continue
-        print("\nMatches:")
-        for i, (aid, name) in enumerate(matches, 1):
-            print(f"  {i}. {name}  [{aid}]")
-        sel = input("Pick number, or type new search, or ENTER to cancel: ").strip()
-        if sel == "":
-            return None
-        if sel.isdigit():
-            n = int(sel)
-            if 1 <= n <= len(matches):
-                return matches[n-1][0]
-            else:
-                print("❌ Out of range.")
-                continue
-        # treat as a new search string
-        q = sel
+    global athletes
 
-def add_athlete_interactive(athletes_dict, file_path=CSV_PATH):
-    """
-    Prompt to add a new athlete. Appends to CSV and updates athletes_dict.
-    Returns new athlete ID on success, else None.
-    """
     clear_screen()
-    print("➕ Add New Athlete\n")
-    distances = get_csv_distances(file_path)
+    print("=== Add New Athlete ===\n")
 
     # ID
     while True:
-        aid = input("New Athlete ID (e.g. A12, must be unique): ").strip().upper()
+        aid = input("New Athlete ID: ").strip().upper()
         if not aid:
-            print("⚠️  Cancelled.")
-            input("Press ENTER to continue…")
-            return None
-        if aid in athletes_dict:
-            print("❌ That ID already exists.")
+            print("❌ ID cannot be empty.")
+            continue
+        if aid in athletes:
+            print("❌ ID already exists.")
             continue
         break
 
     # Name
-    name = input("Athlete Name: ").strip()
+    name = input("Name: ").strip()
     if not name:
-        print("❌ Name cannot be blank.")
-        input("Press ENTER to continue…")
-        return None
+        name = aid
 
-    # PBs
-    new_pbs = {}
+    # Distance columns from existing CSV (or fallback)
+    distances = sorted(
+        {d for a in athletes.values() for d in a["pbs"].keys()},
+        key=lambda x: float(x) if x.replace('.', '', 1).isdigit() else x
+    )
     if not distances:
-        print("ℹ️  No distance columns in CSV header yet. You can add PBs later via race results.")
-    else:
-        print("\nEnter PBs (seconds) for any of these distances; leave blank to skip.")
-        print("Available:", ", ".join(distances))
-        for d in distances:
-            s = input(f"  {d} PB (s): ").strip()
-            if not s:
-                continue
+        distances = ["60", "100", "200", "300", "400", "800", "1500"]
+
+    print("\nEnter PB (seconds) for each distance.")
+    print("  • Number like 12.34")
+    print("  • '?'  → set THIS distance to 999")
+    print("  • '??' → set THIS and ALL REMAINING to 999")
+    print("  • ENTER to skip\n")
+
+    pbs = {}
+    fill_rest_999 = False
+    for dist in distances:
+        if fill_rest_999:
+            pbs[dist] = 999.0
+            continue
+
+        while True:
+            val = input(f"  PB for {dist}m: ").strip()
+            if val == "":
+                break
+            if val == "?":
+                pbs[dist] = 999.0
+                break
+            if val == "??":
+                pbs[dist] = 999.0
+                fill_rest_999 = True
+                break
             try:
-                new_pbs[d] = float(s)
+                pbs[dist] = float(val)
+                break
             except ValueError:
-                print("   ⚠️ Not a number, skipped.")
+                print("   ❌ Enter a number, '?', '??', or blank to skip.")
 
-    # Append to CSV respecting the current header
-    try:
-        with open(file_path, newline='') as f:
-            reader = csv.reader(f)
-            header = next(reader, None) or ['ID', 'Name']
-    except FileNotFoundError:
-        header = ['ID', 'Name'] + sorted(new_pbs.keys(), key=lambda x: float(x) if x.replace('.','',1).isdigit() else x)
-        # create file with header
-        with open(file_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
+    athletes[aid] = {"name": name, "pbs": pbs}
+    write_athletes_csv(athletes, CSV_PATH)
 
-    # Ensure header has all keys we plan to write
-    hdr_set = set(header)
-    need_cols = {'ID','Name'} | set(new_pbs.keys())
-    if not need_cols.issubset(hdr_set):
-        # extend header and rewrite entire CSV to include new columns
-        extra = list(need_cols - hdr_set)
-        header = header + extra
-        # read existing rows
-        try:
-            with open(file_path, newline='') as f:
-                rows = list(csv.reader(f))
-        except FileNotFoundError:
-            rows = []
-        # rewrite with extended header
-        with open(file_path, 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            # write old data (skip previous header if present)
-            for row in rows[1:] if rows and rows[0] and rows[0][0] == 'ID' else rows:
-                # pad/truncate to new header length
-                row_map = dict(zip(rows[0], row)) if rows else {}
-                out = []
-                for col in header:
-                    if col in ('ID','Name'):
-                        out.append(row_map.get(col, ''))
-                    else:
-                        out.append(row_map.get(col, ''))
-                w.writerow(out)
-
-    # now append the new athlete line
-    with open(file_path, 'a', newline='') as f:
-        w = csv.writer(f)
-        row = []
-        for col in header:
-            if col == 'ID':
-                row.append(aid)
-            elif col == 'Name':
-                row.append(name)
-            else:
-                val = new_pbs.get(col)
-                row.append(f"{val:.2f}" if isinstance(val, float) else '')
-        w.writerow(row)
-
-    # update in-memory
-    athletes_dict[aid] = {"name": name, "pbs": new_pbs}
-    print(f"\n✅ Added {name} [{aid}]")
+    print(f"\n✅ Added athlete {aid} — {name}")
     input("Press ENTER to continue…")
-    return aid
 
-def get_race_participants(athletes, start_points):
+# ───────────────────────── Race building & helpers ─────────────────────────
+
+def resolve_athlete_input(text, distance_hint=None):
     """
-    Enter IDs into lanes; supports:
-      - '?query' to search by name
-      - '+' to add a new athlete on the spot
+    Accept an input that can be:
+      • exact athlete ID
+      • partial name fragment (auto-search)
+      • '?' then prompt query
+      • '+' to add a new athlete
+    Returns athlete ID or '' if no selection.
+    """
+    t = text.strip()
+    if t == "":
+        return ""
+    if t == "+":
+        add_new_athlete_interactive()
+        return ""
+    if t == "?":
+        q = input("Enter part of the name to search: ").strip()
+        matches = search_athletes_by_name(q)
+        return pick_athlete_from_list(matches, distance_hint)
+    # exact ID
+    up = t.upper()
+    if up in athletes:
+        return up
+    # treat as name fragment
+    matches = search_athletes_by_name(t)
+    return pick_athlete_from_list(matches, distance_hint)
+
+def pick_athlete_from_list(matches, distance_hint=None):
+    if not matches:
+        print("   ⚠️  No matches.")
+        time.sleep(0.7)
+        return ""
+    if len(matches) == 1:
+        print(f"   → {matches[0][0]} — {matches[0][1]}")
+        time.sleep(0.4)
+        return matches[0][0]
+    print("\nMatches:")
+    print(f"{'#':<3}{'ID':<10}{'Name':<24}{'PB@dist':<10}")
+    print("-" * 50)
+    for i, (aid, name) in enumerate(matches, 1):
+        pb = "-"
+        if distance_hint and distance_hint in athletes[aid]["pbs"]:
+            pb = f"{athletes[aid]['pbs'][distance_hint]:.2f}"
+        print(f"{i:<3}{aid:<10}{name:<24}{pb:<10}")
+    sel = input("Pick number (ENTER to cancel): ").strip()
+    if sel.isdigit():
+        idx = int(sel)
+        if 1 <= idx <= len(matches):
+            return matches[idx-1][0]
+    return ""
+
+def get_race_participants(athletes_dict, start_points_dict):
+    """
+    Enhanced: supports entering '?', '+', or name fragments when assigning lanes.
     """
     racers = {}
-    for dist, sp in start_points.items():
-        print(f"Setting up race for {dist}m:")
+    for dist, sp in start_points_dict.items():
+        print(f"\nSetting up race for {dist}m:")
         if sp["has_lanes"]:
             for lane in range(1, sp["num_lanes"] + 1):
                 while True:
-                    aid_in = input(f"  Lane {lane} Athlete ID (Enter to skip, '?name' to search, '+' to add): ").strip()
+                    aid_in = input(f"  Lane {lane} Athlete (ID, name, '?' to search, '+' to add, ENTER to skip): ").strip()
                     if aid_in == "":
                         break
-                    if aid_in.startswith("?"):
-                        picked = search_athletes_prompt(athletes, aid_in[1:])
-                        if picked:
-                            aid_in = picked
-                        else:
-                            continue
-                    if aid_in == "+":
-                        new_id = add_athlete_interactive(athletes)
-                        if not new_id:
-                            continue
-                        aid_in = new_id
-                    aid = aid_in.upper()
-                    if aid not in athletes:
+                    aid = resolve_athlete_input(aid_in, distance_hint=dist)
+                    if aid == "":
+                        continue
+                    if aid not in athletes_dict:
                         print("❌ ID not found.")
                         continue
                     if aid in racers:
                         print("⚠️ Already added.")
                         continue
                     racers[aid] = {
-                        "name": athletes[aid]["name"],
-                        "pbs": athletes[aid]["pbs"].copy(),
+                        "name": athletes_dict[aid]["name"],
+                        "pbs": athletes_dict[aid]["pbs"].copy(),
                         "start_point": dist
                     }
                     sp["assignments"][f"Lane {lane}"] = aid
                     break
         else:
-            print("  Enter athletes for this start point (press Enter to finish).")
+            print("  Enter athletes for this start point (press ENTER to finish).")
             while True:
-                aid_in = input("  Athlete ID ('?name' to search, '+' to add): ").strip()
+                aid_in = input("  Athlete (ID, name, '?' to search, '+' to add): ").strip()
                 if aid_in == "":
                     break
-                if aid_in.startswith("?"):
-                    picked = search_athletes_prompt(athletes, aid_in[1:])
-                    if picked:
-                        aid_in = picked
-                    else:
-                        continue
-                if aid_in == "+":
-                    new_id = add_athlete_interactive(athletes)
-                    if not new_id:
-                        continue
-                    aid_in = new_id
-                aid = aid_in.upper()
-                if aid not in athletes:
+                aid = resolve_athlete_input(aid_in, distance_hint=dist)
+                if aid == "":
+                    continue
+                if aid not in athletes_dict:
                     print("❌ ID not found.")
                     continue
                 if aid in racers:
                     print("⚠️ Already added.")
                     continue
                 racers[aid] = {
-                    "name": athletes[aid]["name"],
-                    "pbs": athletes[aid]["pbs"].copy(),
+                    "name": athletes_dict[aid]["name"],
+                    "pbs": athletes_dict[aid]["pbs"].copy(),
                     "start_point": dist
                 }
                 sp["assignments"][aid] = aid
@@ -570,26 +553,26 @@ def add_virtual_devices():
         print()
     return devices
 
-def collect_start_point_timings(start_points, athletes):
+def collect_start_point_timings(start_points_dict, athletes_dict):
     data = {}
-    for dist, sp in start_points.items():
+    for dist, sp in start_points_dict.items():
         rows = []
         if sp["has_lanes"]:
-            entries = [(lane, aid) for lane, aid in sp["assignments"].items() if aid in athletes]
-            pbs = [athletes[aid]["pbs"].get(dist) for _, aid in entries if dist in athletes[aid]["pbs"]]
+            entries = [(lane, aid) for lane, aid in sp["assignments"].items() if aid in athletes_dict]
+            pbs = [athletes_dict[aid]["pbs"].get(dist) for _, aid in entries if dist in athletes_dict[aid]["pbs"]]
             slowest = max(pbs) if pbs else 0.0
         else:
-            entries = [(None, aid) for aid in sp["assignments"].values() if aid in athletes]
+            entries = [(None, aid) for aid in sp["assignments"].values() if aid in athletes_dict]
             slowest = None
         for lane, aid in entries:
-            pb_val = athletes[aid]["pbs"].get(dist)
+            pb_val = athletes_dict[aid]["pbs"].get(dist)
             if pb_val is None:
                 continue
             headstart = round(slowest - pb_val, 2) if sp["has_lanes"] else 0.0
             rows.append({
                 "lane": lane if sp["has_lanes"] else "-",
                 "id": aid,
-                "name": athletes[aid]["name"],
+                "name": athletes_dict[aid]["name"],
                 "pb": pb_val,
                 "start": headstart
             })
@@ -619,30 +602,228 @@ def calculate_timings(racers):
                       f"{row['pb']:<8.2f}{row['start']:<10.2f}")
     input("Press ENTER to return...")
 
+    # inject into racers
     for dist, rows in timing_data.items():
         sp = start_points[dist]
         if sp['has_lanes']:
             for row in rows:
                 aid = row['id']
-                # Preserve any lane reassignment; just refresh derived fields
-                racers[aid]['start'] = row['start']
-                racers[aid]['pb'] = row['pb']
-                # Map device by current lane assignment
-                assigned_lane = None
-                for ln, a in sp['assignments'].items():
-                    if a == aid:
-                        assigned_lane = ln
-                        break
-                racers[aid]['device'] = sp['device_assignments'].get(assigned_lane, '-')
+                if aid in racers:
+                    racers[aid]['start'] = row['start']
+                    racers[aid]['device'] = sp['device_assignments'].get(row['lane'], '-')
+                    racers[aid]['pb'] = row['pb']
         else:
             default_dev = sp['devices'][0] if sp['devices'] else '-'
             for row in rows:
                 aid = row['id']
-                racers[aid]['start'] = 0.0
-                racers[aid]['device'] = default_dev
-                racers[aid]['pb'] = row['pb']
+                if aid in racers:
+                    racers[aid]['start'] = 0.0
+                    racers[aid]['device'] = default_dev
+                    racers[aid]['pb'] = row['pb']
 
     return timing_data
+
+# ───────────────────────── Overrides & lane patterns ─────────────────────────
+
+def override_start_delays(racers):
+    """
+    Allow the user to override 'start' values after Calculate Timings.
+    """
+    from collections import defaultdict
+    if not racers:
+        print("ℹ️  No racers loaded. Setup race first.")
+        input("Press ENTER to continue…")
+        return
+
+    while True:
+        clear_screen()
+        grouped = defaultdict(list)  # dist -> list of (lane_key, aid)
+        for dist, sp in start_points.items():
+            if not sp.get("assignments"):
+                continue
+            if sp.get("has_lanes"):
+                for ln in range(1, sp["num_lanes"] + 1):
+                    lane_key = f"Lane {ln}"
+                    aid = sp["assignments"].get(lane_key)
+                    if aid and aid in racers and racers[aid].get("start_point") == dist:
+                        grouped[dist].append((lane_key, aid))
+            else:
+                for aid in sp["assignments"].values():
+                    if aid and aid in racers and racers[aid].get("start_point") == dist:
+                        grouped[dist].append(("-", aid))
+
+        index = []
+        print("✏️  Override Start Delays\n")
+        print("  • Pick athlete by NUMBER or ID to set an absolute start (seconds)")
+        print("  • Or type:  all <±delta>        (e.g. all +0.20)")
+        print("  • Or type:  dist <D> <±delta>   (e.g. dist 100 +0.10)")
+        print("  • ENTER to finish\n")
+
+        row_no = 1
+        for dist in sorted(grouped, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
+            print(f"=== {dist}m ===")
+            print(f"{'#':<3}{'Lane':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Start(s)':<10}")
+            print("-" * 61)
+            for lane_key, aid in grouped[dist]:
+                r = racers[aid]
+                pb = r.get('pb', 0.0)
+                st = r.get('start', 0.0)
+                print(f"{row_no:<3}{lane_key:<8}{aid:<12}{r['name']:<20}{pb:<8.2f}{st:<10.2f}")
+                index.append((row_no, dist, lane_key, aid))
+                row_no += 1
+            print()
+
+        sel = input("Select #/ID (or 'all +/-x.xx' / 'dist D +/-x.xx', ENTER to finish): ").strip()
+        if sel == "":
+            break
+
+        parts = sel.split()
+        if len(parts) == 2 and parts[0].lower() == "all":
+            try:
+                delta = float(parts[1])
+            except ValueError:
+                print("❌ Could not parse delta.")
+                time.sleep(0.8)
+                continue
+            for _, _, _, aid in index:
+                racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
+            print(f"✅ Applied {delta:+.2f}s to ALL starts.")
+            time.sleep(0.8)
+            continue
+
+        if len(parts) == 3 and parts[0].lower() == "dist":
+            dist_key = parts[1]
+            try:
+                delta = float(parts[2])
+            except ValueError:
+                print("❌ Could not parse delta.")
+                time.sleep(0.8)
+                continue
+            applied = 0
+            for _, d, _, aid in index:
+                if d == dist_key:
+                    racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
+                    applied += 1
+            if applied:
+                print(f"✅ Applied {delta:+.2f}s to {applied} athlete(s) in {dist_key}m.")
+            else:
+                print(f"⚠️  No athletes found for distance '{dist_key}'.")
+            time.sleep(0.8)
+            continue
+
+        # individual
+        aid_to_edit = None
+        if sel.isdigit():
+            num = int(sel)
+            match = next((t for t in index if t[0] == num), None)
+            if match:
+                aid_to_edit = match[3]
+        else:
+            cand = sel.upper()
+            if cand in athletes and cand in racers:
+                aid_to_edit = cand
+
+        if not aid_to_edit:
+            print("❌ Not a valid selection.")
+            time.sleep(0.8)
+            continue
+
+        current = racers[aid_to_edit].get('start', 0.0)
+        val = input(f"New absolute start for {aid_to_edit} ({racers[aid_to_edit]['name']}) [current {current:.2f}s]: ").strip()
+        if val == "":
+            continue
+        try:
+            new_start = float(val)
+        except ValueError:
+            print("❌ Please enter a number (e.g. 1.25 or -0.30).")
+            time.sleep(0.8)
+            continue
+        racers[aid_to_edit]['start'] = new_start
+        print(f"✅ Updated {aid_to_edit} → {new_start:.2f}s")
+        time.sleep(0.8)
+
+def _lane_sequence_outside_in(num_lanes):
+    # [1, N, 2, N-1, 3, N-2, ...]
+    seq = []
+    left, right = 1, num_lanes
+    while left <= right:
+        seq.append(left)
+        if right != left:
+            seq.append(right)
+        left += 1
+        right -= 1
+    return seq
+
+def _lane_sequence_left_to_right(num_lanes):
+    # [1,2,3,...,N]
+    return list(range(1, num_lanes + 1))
+
+def apply_handicap_lane_pattern(distance, racers, pattern="outside_in"):
+    """
+    Reorders lane assignments for a laned start point based on computed 'start' values.
+    pattern:
+      • "outside_in"     → slowest to fastest mapped to [1, N, 2, N-1, ...]
+      • "left_to_right"  → slowest..fastest mapped to [1, 2, 3, ..., N]
+    Displays the new mapping.
+    """
+    if distance not in start_points:
+        print(f"⚠️  Distance {distance} not defined in start points.")
+        input("Press ENTER…")
+        return
+    sp = start_points[distance]
+    if not sp.get("has_lanes"):
+        print("⚠️  Patterning only applies to laned start points.")
+        input("Press ENTER…")
+        return
+
+    # extract current participants tied to this distance
+    current = []
+    for ln in range(1, sp["num_lanes"] + 1):
+        aid = sp["assignments"].get(f"Lane {ln}")
+        if aid and aid in racers and racers[aid].get("start_point") == distance:
+            current.append(aid)
+
+    if not current:
+        print("⚠️  No athletes assigned to lanes yet.")
+        input("Press ENTER…")
+        return
+
+    # sort by start descending (largest headstart = slowest), tiebreak by PB desc
+    sorted_aids = sorted(
+        current,
+        key=lambda a: (racers[a].get("start", 0.0), racers[a].get("pb", 0.0)),
+        reverse=True
+    )
+
+    if pattern == "outside_in":
+        lane_order = _lane_sequence_outside_in(sp["num_lanes"])
+    else:
+        lane_order = _lane_sequence_left_to_right(sp["num_lanes"])
+
+    # map athletes to lane order; ignore extra lanes, or if more athletes than lanes, truncate
+    sp["assignments"].clear()
+    pairs = []
+    for idx, aid in enumerate(sorted_aids):
+        if idx >= len(lane_order):
+            print("⚠️  More athletes than lanes. Extra athletes not assigned.")
+            break
+        lane = lane_order[idx]
+        sp["assignments"][f"Lane {lane}"] = aid
+        pairs.append((lane, aid))
+
+    # Show the new mapping
+    clear_screen()
+    print(f"🏟️  Lane pattern for {distance}m → {pattern.replace('_',' ').title()}\n")
+    print(f"{'Lane':<6}{'Athlete ID':<12}{'Name':<22}{'PB(s)':<10}{'Start(s)':<8}")
+    print("-" * 60)
+    for lane, aid in sorted(pairs, key=lambda x: x[0]):
+        r = racers[aid]
+        pb = r.get('pb', 0.0)
+        st = r.get('start', 0.0)
+        print(f"{lane:<6}{aid:<12}{r['name']:<22}{pb:<10.2f}{st:<8.2f}")
+    input("\nPress ENTER to continue…")
+
+# ───────────────────────── Command sequence & RF start ─────────────────────────
 
 def show_command_sequence(racers):
     if not racers:
@@ -709,7 +890,6 @@ def start_race_sequence(racers):
         o = int(round(times['orange_on']))
         g = int(round(times['green_on']))
         f = int(round(times['green_off']))
-        # NEW: attach volume explicitly. Per-device overrides beat default.
         vol = device_volumes.get(dev, default_volume)
         entry = f"{dev}{{{r},{o},{g},{f}}}"
         if isinstance(vol, int):
@@ -786,6 +966,8 @@ def show_device_schedule(racers):
             f"{red_start:<10.2f}{orange_start:<12.2f}{green_start:<10.2f}"
         )
     input("\nPress ENTER to continue...")
+
+# ───────────────────────── Results & persistence ─────────────────────────
 
 def enter_race_results(racers):
     """
@@ -923,6 +1105,7 @@ def enter_race_results(racers):
 
     save = input("\nSave these results to sessions.csv? (y/n): ").strip().lower()
     if save == 'y':
+        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
         write_header = not os.path.exists(SESSION_FILE)
         with open(SESSION_FILE, 'a', newline='') as f:
             w = csv.writer(f)
@@ -941,143 +1124,49 @@ def enter_race_results(racers):
             for timestamp, dist, aid, name, start_s, finish_s, actual_s, new_pb in session_rows:
                 if new_pb == 'YES' and actual_s != 'DLQ':
                     athletes[aid]['pbs'][dist] = float(actual_s)
-            distances = sorted(
-                { d for ath in athletes.values() for d in ath['pbs'].keys() },
-                key=lambda x: float(x) if x.replace('.', '', 1).isdigit() else x
-            )
-            with open(CSV_PATH, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['ID','Name'] + distances)
-                for aid, ath in athletes.items():
-                    row = [aid, ath['name']]
-                    for dist in distances:
-                        val = ath['pbs'].get(dist)
-                        row.append(f"{val:.2f}" if isinstance(val, float) else '')
-                    writer.writerow(row)
+            write_athletes_csv(athletes, CSV_PATH)
             print("✅ athletes.csv updated with new PBs.")
 
     input("\nPress ENTER to continue...")
 
-# ───────────────────────── Handicap lane helpers ─────────────────────────
+# ───────────────────────── Menus ─────────────────────────
 
-def _sorted_aids_by_handicap(racers, aids):
-    """
-    Return athlete IDs sorted slowest→fastest by their computed 'start'.
-    (start = slowest_pb - pb, so slowest has 0, faster have larger positive starts)
-    Tie-break by larger PB first (slower), then name.
-    """
-    return sorted(
-        aids,
-        key=lambda aid: (racers.get(aid, {}).get('start', 0.0),
-                         -racers.get(aid, {}).get('pb', 0.0),
-                         racers.get(aid, {}).get('name', ''))
-    )
-
-def _lane_order_snake(num_lanes):
-    """
-    1, N, 2, N-1, 3, N-2, ... (works for any lane count)
-    """
-    order = []
-    left, right = 1, num_lanes
-    while left <= right:
-        order.append(f"Lane {left}")
-        if right != left:
-            order.append(f"Lane {right}")
-        left += 1
-        right -= 1
-    return order
-
-def _apply_lane_pattern_for_distance(racers, distance, pattern):
-    """
-    pattern:
-      'outside_in' → slowest on the OUTSIDE lanes (highest numbers), then inward.
-      'inside_out' → SNAKE: slowest L1, next LN, then L2, LN-1, … toward middle.
-    Rewrites start_points[distance]['assignments'] and updates racers' device mapping.
-    Displays the new plan.
-    """
-    sp = start_points.get(distance)
-    if not sp or not sp.get('has_lanes'):
-        print(f"ℹ️  {distance}m has no lanes (nothing to rearrange).")
-        input("Press ENTER to continue…"); return
-
-    num = sp['num_lanes']
-    # Current lane → athlete ids that actually exist in racers
-    current_pairs = [(ln, sp['assignments'].get(f"Lane {ln}")) for ln in range(1, num+1)]
-    aids = [aid for _, aid in current_pairs if aid and aid in racers]
-    if not aids:
-        print("⚠️  No lane assignments yet for this distance.")
-        input("Press ENTER to continue…"); return
-
-    ordered_aids = _sorted_aids_by_handicap(racers, aids)  # slowest→fastest
-
-    if pattern == 'outside_in':
-        lane_order = [f"Lane {ln}" for ln in range(num, 0, -1)]         # N..1
-        title = "Outside → Inside"
-    else:  # 'inside_out' is the requested snake pattern
-        lane_order = _lane_order_snake(num)                              # 1,N,2,N-1,...
-        title = "Snake: 1, N, 2, N-1, …"
-
-    # Build new lane→athlete map following the chosen order
-    new_assign = {}
-    for i, aid in enumerate(ordered_aids):
-        if i < len(lane_order):
-            new_assign[lane_order[i]] = aid
-    sp['assignments'] = new_assign  # replace
-
-    # Update racers' device field so scheduling uses the new lanes/devices
-    for lane_key, aid in sp['assignments'].items():
-        dev = sp['device_assignments'].get(lane_key, '-')
-        if aid in racers:
-            racers[aid]['device'] = dev
-
-    # Show the plan (print lanes in natural ascending order for readability)
-    clear_screen()
-    print(f"🏟️  Handicap Lane Plan — {distance}m ({title})\n")
-    print(f"{'Lane':<8}{'Device':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Headstart(s)':<12}")
-    print("-"*68)
-    for ln in range(1, num+1):
-        lane_key = f"Lane {ln}"
-        aid = sp['assignments'].get(lane_key, '')
-        dev = sp['device_assignments'].get(lane_key, '-')
-        if aid:
-            r  = racers[aid]
-            pb = r.get('pb', 0.0)
-            st = r.get('start', 0.0)
-            print(f"{lane_key:<8}{dev:<8}{aid:<12}{r['name']:<20}{pb:<8.2f}{st:<12.2f}")
-        else:
-            print(f"{lane_key:<8}{'-':<8}{'-':<12}{'-':<20}{'-':<8}{'-':<12}")
-    input("\nPress ENTER to continue…")
-
-# ───────────────────────── Athletes menu ─────────────────────────
-
-def athletes_menu():
+def devices_menu():
+    global devices
     while True:
         clear_screen()
-        print("=== Athletes ===")
-        print("1. Search by name")
-        print("2. Add new athlete")
+        print("=== Devices ===")
+        print("\nCurrent devices:", ", ".join(sorted(devices, key=lambda x:int(x))) if devices else "(none)")
+        print("\n1. Discover (DISCOVER)")
+        print("2. Flash test (FLASH)")
+        print("3. Set default volume")
+        print("4. Set per-device volumes")
+        print("5. Show volume settings")
+        print("6. Add virtual devices (for bench)")
         print("Enter to go back")
-        ch = input("Select: ").strip()
-        if ch == '1':
-            q = input("Type part of a name: ").strip()
-            if not q:
-                continue
-            hits = search_athletes(athletes, q)
-            if not hits:
-                print("No matches.")
-            else:
-                print("\nMatches:")
-                for aid, name in hits:
-                    print(f"  {name}  [{aid}]")
-            input("\nPress ENTER to continue…")
-        elif ch == '2':
-            add_athlete_interactive(athletes, CSV_PATH)
-        elif ch == '':
+        choice = input("Select: ").strip()
+        if choice == '1':
+            found = discover_devices(timeout=2)
+            if found:
+                for d in found:
+                    if d not in devices:
+                        devices.append(d)
+            input("Press ENTER to continue…")
+        elif choice == '2':
+            flash_all_devices(timeout=2)
+            input("Press ENTER to continue…")
+        elif choice == '3':
+            set_default_volume_interactive()
+        elif choice == '4':
+            set_per_device_volumes()
+        elif choice == '5':
+            list_volumes()
+        elif choice == '6':
+            add_virtual_devices()
+        elif choice == '':
             break
         else:
             input("Press ENTER to continue...")
-
-# ───────────────────────── Setup Track (trimmed) ─────────────────────────
 
 def setup_track():
     global devices
@@ -1144,183 +1233,34 @@ def setup_track():
         else:
             input("Press ENTER to continue...")
 
-# ───────────────────────── Devices menu ─────────────────────────
-def devices_menu():
-    global devices
+def athletes_menu():
     while True:
         clear_screen()
-        print("=== Devices ===")
-        print("\nCurrent devices:", ", ".join(sorted(devices, key=lambda x: int(x))) if devices else "(none)")
-        print("\n1. Discover (DISCOVER)")
-        print("2. Flash test (FLASH)")
-        print("3. Set default volume")
-        print("4. Set per-device volumes")
-        print("5. Show volume settings")
-        print("6. Add virtual devices (for bench)")
+        print("=== Athletes ===")
+        print("1. Add new athlete")
+        print("2. Find by name")
         print("Enter to go back")
         choice = input("Select: ").strip()
         if choice == '1':
-            found = discover_devices(timeout=2)
-            if found:
-                # merge new finds into devices
-                for d in found:
-                    if d not in devices:
-                        devices.append(d)
-            input("Press ENTER to continue…")
+            add_new_athlete_interactive()
         elif choice == '2':
-            flash_all_devices(timeout=2)
-            input("Press ENTER to continue…")
-        elif choice == '3':
-            set_default_volume_interactive()
-        elif choice == '4':
-            set_per_device_volumes()
-        elif choice == '5':
-            list_volumes()
-        elif choice == '6':
-            add_virtual_devices()
+            q = input("Enter part of name: ").strip()
+            matches = search_athletes_by_name(q)
+            if not matches:
+                print("No matches.")
+            else:
+                print(f"\n{'ID':<10}{'Name':<26}")
+                print("-" * 36)
+                for aid, name in matches:
+                    print(f"{aid:<10}{name:<26}")
+            input("\nPress ENTER to continue…")
         elif choice == '':
             break
         else:
-            input("Press ENTER to continue...")
-
-def override_start_delays(racers):
-    """
-    Let the user override 'start' (headstart) values after Calculate Timings.
-    You can:
-      • Select an athlete (by number or ID) and set an absolute start (seconds)
-      • Type:  all <±delta>     → add/subtract a delta to ALL starts (e.g. 'all +0.20')
-      • Type:  dist <D> <±delta>→ add/subtract a delta to one distance group (e.g. 'dist 100 +0.10')
-      • Press ENTER to finish
-    """
-    from collections import defaultdict
-
-    if not racers:
-        print("ℹ️  No racers loaded. Setup race first.")
-        input("Press ENTER to continue…")
-        return
-
-    while True:
-        clear_screen()
-        # Build a stable, grouped listing by distance and lane
-        grouped = defaultdict(list)  # dist -> list of (lane_key, aid)
-        for dist, sp in start_points.items():
-            if not sp.get("assignments"):
-                continue
-            if sp.get("has_lanes"):
-                for ln in range(1, sp["num_lanes"] + 1):
-                    lane_key = f"Lane {ln}"
-                    aid = sp["assignments"].get(lane_key)
-                    if aid and aid in racers and racers[aid].get("start_point") == dist:
-                        grouped[dist].append((lane_key, aid))
-            else:
-                # non-laned start point
-                for aid in sp["assignments"].values():
-                    if aid and aid in racers and racers[aid].get("start_point") == dist:
-                        grouped[dist].append(("-", aid))
-
-        # Build flat index list for selection
-        index = []
-        print("✏️  Override Start Delays\n")
-        print("Instructions:")
-        print("  • Pick athlete by NUMBER or ID to set an absolute start (seconds)")
-        print("  • Or type:  all <±delta>        (e.g. all +0.20)")
-        print("  • Or type:  dist <D> <±delta>   (e.g. dist 100 +0.10)")
-        print("  • ENTER to finish\n")
-
-        row_no = 1
-        for dist in sorted(grouped, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
-            print(f"=== {dist}m ===")
-            print(f"{'#':<3}{'Lane':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Start(s)':<10}")
-            print("-" * 61)
-            for lane_key, aid in grouped[dist]:
-                r = racers[aid]
-                pb = r.get('pb', 0.0)
-                st = r.get('start', 0.0)
-                print(f"{row_no:<3}{lane_key:<8}{aid:<12}{r['name']:<20}{pb:<8.2f}{st:<10.2f}")
-                index.append((row_no, dist, lane_key, aid))
-                row_no += 1
-            print()
-
-        # Prompt
-        sel = input("Select # or ID (or 'all +/-x.xx' / 'dist D +/-x.xx', ENTER to finish): ").strip()
-        if sel == "":
-            break
-
-        # Handle 'all <delta>'
-        parts = sel.split()
-        if len(parts) == 2 and parts[0].lower() == "all":
-            try:
-                delta = float(parts[1])
-            except ValueError:
-                print("❌ Could not parse delta.")
-                time.sleep(0.8)
-                continue
-            for _, _, _, aid in index:
-                racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
-            print(f"✅ Applied {delta:+.2f}s to ALL starts.")
-            time.sleep(0.8)
-            continue
-
-        # Handle 'dist <D> <delta>'
-        if len(parts) == 3 and parts[0].lower() == "dist":
-            dist_key = parts[1]
-            try:
-                delta = float(parts[2])
-            except ValueError:
-                print("❌ Could not parse delta.")
-                time.sleep(0.8)
-                continue
-            # apply to only that distance
-            applied = 0
-            for _, d, _, aid in index:
-                if d == dist_key:
-                    racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
-                    applied += 1
-            if applied:
-                print(f"✅ Applied {delta:+.2f}s to {applied} athlete(s) in {dist_key}m.")
-            else:
-                print(f"⚠️  No athletes found for distance '{dist_key}'.")
-            time.sleep(0.8)
-            continue
-
-        # Individual edit by number or ID
-        # Resolve # → aid
-        aid_to_edit = None
-        if sel.isdigit():
-            num = int(sel)
-            match = next((t for t in index if t[0] == num), None)
-            if match:
-                aid_to_edit = match[3]
-        else:
-            # assume it's an ID
-            cand = sel.upper()
-            if cand in racers:
-                aid_to_edit = cand
-
-        if not aid_to_edit:
-            print("❌ Not a valid selection.")
-            time.sleep(0.8)
-            continue
-
-        # Prompt new absolute start
-        current = racers[aid_to_edit].get('start', 0.0)
-        prompt = f"New absolute start for {aid_to_edit} ({racers[aid_to_edit]['name']}) [current {current:.2f}s]: "
-        val = input(prompt).strip()
-        if val == "":
-            continue
-        try:
-            new_start = float(val)
-        except ValueError:
-            print("❌ Please enter a number (e.g. 1.25 or -0.30).")
-            time.sleep(0.8)
-            continue
-
-        racers[aid_to_edit]['start'] = new_start
-        print(f"✅ Updated {aid_to_edit} → {new_start:.2f}s")
-        time.sleep(0.8)
-
+            input("Press ENTER to continue…")
 
 # ───────────────────────── Main ─────────────────────────
+
 def main():
     global athletes, racers
     athletes = load_athletes()
@@ -1346,24 +1286,31 @@ def main():
         elif choice == '3':
             racers = get_race_participants(athletes, start_points)
             if racers:
-                # Ask which distance to use when computing handicaps
                 distance = input("Distance for handicap calc (e.g. 100): ").strip()
                 if distance:
                     calculate_staggered_starts(racers, distance)
-
-                    # Choose lane pattern
-                    print("\nHandicap lane pattern:")
-                    print("  1) Slowest on OUTSIDE lanes (devices fire outside → inside)")
-                    print("  2) Slowest L1, next LN, then L2, LN-1, … (snake across)")
-                    print("  Enter to skip (keep current lanes)")
-                    pat = input("Select: ").strip()
-                    if pat == '1':
-                        _apply_lane_pattern_for_distance(racers, distance, 'outside_in')
-                    elif pat == '2':
-                        _apply_lane_pattern_for_distance(racers, distance, 'inside_out')
+                    # Optional: choose lane pattern if laned
+                    if distance in start_points and start_points[distance].get("has_lanes"):
+                        while True:
+                            print("\nLane pattern options:")
+                            print("  1) Outside-in (slowest to [1, N, 2, N-1, ...])")
+                            print("  2) Left-to-right (slowest..fastest → lanes 1..N)")
+                            print("ENTER to skip")
+                            pat = input("Choose pattern: ").strip()
+                            if pat == '':
+                                break
+                            if pat == '1':
+                                apply_handicap_lane_pattern(distance, racers, pattern="outside_in")
+                                break
+                            elif pat == '2':
+                                apply_handicap_lane_pattern(distance, racers, pattern="left_to_right")
+                                break
+                            else:
+                                print("❌ Invalid choice.")
         elif choice == '4':
-                calculate_timings(racers)
-                override_start_delays(racers)
+            calculate_timings(racers)
+            # NEW: let the user override computed starts
+            override_start_delays(racers)
         elif choice == '5':
             show_device_schedule(racers)
         elif choice == '6':
@@ -1378,7 +1325,7 @@ def main():
                 ans = input("Are you sure you want to exit? (y/n): ").strip().lower()
                 if ans == 'y':
                     return  # triggers the finally: ser.close()
-                elif ans == 'n' or ans == '':
+                elif ans in ('n', ''):
                     break    # back to the main menu
                 else:
                     print("Please answer 'y' or 'n'.")
