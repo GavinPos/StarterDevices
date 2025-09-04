@@ -639,13 +639,14 @@ def compute_and_apply_timings(racers):
                     racers[aid]['pb']     = row['pb']
                     racers[aid]['device'] = sp['device_assignments'].get(row['lane'], '-')
         else:
+            # SCRATCH: racers have a shared start; devices handled in schedule builder
             default_dev = sp['devices'][0] if sp.get('devices') else '-'
             for row in rows:
                 aid = row['id']
                 if aid in racers:
                     racers[aid]['start']  = 0.0
                     racers[aid]['pb']     = row['pb']
-                    racers[aid]['device'] = default_dev
+                    racers[aid]['device'] = '-'  # not used for scratch; schedule adds all devices
 
     return timing_data
 
@@ -768,6 +769,33 @@ def override_start_delays(racers):
         print(f"✅ Updated {aid_to_edit} → {new_start:.2f}s")
         time.sleep(0.8)
 
+def override_scratch_offset(distance, racers):
+    """Set a single absolute start time (seconds) for a scratch distance."""
+    sp = start_points.get(distance)
+    if not sp or sp.get('has_lanes'):
+        return  # only for scratch
+
+    aids = [aid for aid, r in racers.items() if r.get('start_point') == distance]
+    if not aids:
+        return
+
+    current_vals = sorted({ float(racers[a].get('start', 0.0)) for a in aids })
+    cur_str = ", ".join(f"{v:.2f}" for v in current_vals)
+    print(f"\nScratch {distance}m current start(s): {cur_str}")
+    val = input(f"Set a GLOBAL absolute start for {distance}m (seconds, ENTER to keep): ").strip()
+    if val == "":
+        return
+    try:
+        new_start = float(val)
+    except ValueError:
+        print("❌ Please enter a number.")
+        time.sleep(0.8)
+        return
+    for a in aids:
+        racers[a]['start'] = new_start
+    print(f"✅ Set all {distance}m scratch starts to {new_start:.2f}s")
+    time.sleep(0.8)
+
 def _lane_sequence_outside_in(num_lanes):
     # [1, N, 2, N-1, 3, N-2, ...]
     seq = []
@@ -878,14 +906,21 @@ def show_command_sequence(racers):
         print(f"{t:>7.2f}  {dev:<12} {action}")
 
 def build_device_schedule(racers):
-    starts = [r.get('start', 0.0) for r in racers.values()]
-    min_start = min(starts) if starts else 0.0
-    schedule = {}
-    RED_D = 5.0; ORANGE_D = 7.0; GREEN_D = 9.0; OFF_D = 11.0
-    for aid, r in racers.items():
-        dev = r.get('device', '-')
-        red_on = r.get('start', 0.0) - min_start
-        schedule[dev] = {
+    """
+    Build a per-device schedule. For laned starts, each lane's device follows
+    that lane's athlete start. For scratch (no lanes), *all* devices at that
+    start point fire with the same timings.
+    """
+    # Global reference so the earliest start happens at t=0
+    if racers:
+        min_start_all = min(float(r.get('start', 0.0)) for r in racers.values())
+    else:
+        min_start_all = 0.0
+
+    RED_D, ORANGE_D, GREEN_D, OFF_D = 5.0, 7.0, 9.0, 11.0
+
+    def _times_from_red_on(red_on):
+        return {
             'red_on':     red_on,
             'red_off':    red_on + RED_D,
             'orange_on':  red_on + RED_D,
@@ -893,6 +928,34 @@ def build_device_schedule(racers):
             'green_on':   red_on + GREEN_D,
             'green_off':  red_on + OFF_D
         }
+
+    schedule = {}
+
+    for dist, sp in start_points.items():
+        if sp.get('has_lanes'):
+            # Lane-based: one device per lane
+            for ln in range(1, sp['num_lanes'] + 1):
+                dev = sp['device_assignments'].get(f"Lane {ln}")
+                if not dev:
+                    continue
+                aid = sp['assignments'].get(f"Lane {ln}")
+                if aid and aid in racers:
+                    red_on = float(racers[aid].get('start', 0.0)) - min_start_all
+                else:
+                    red_on = 0.0 - min_start_all
+                schedule[dev] = _times_from_red_on(red_on)
+        else:
+            # SCRATCH: every device at this start point fires with identical timings
+            dist_aids = [a for a, r in racers.items() if r.get('start_point') == dist]
+            if dist_aids:
+                # Keep offsets stable relative to other distances, if any
+                dist_min = min(float(racers[a].get('start', 0.0)) for a in dist_aids)
+            else:
+                dist_min = 0.0
+            red_on = dist_min - min_start_all
+            for dev in sp.get('devices', []):
+                schedule[dev] = _times_from_red_on(red_on)
+
     return schedule
 
 def start_race_sequence(racers):
@@ -950,7 +1013,7 @@ def send_start_command(host="127.0.0.1", port=6000, payload=b"s"):
     try:
         for attempt in range(1, 6):
             try:
-                with socket.create_connection((host, port), timeout=0.2) as sock:
+                with socket.create_connection((host, port), timeout=0.2) as sock):
                     sock.sendall(payload)
                 print(f"✅ Sent {payload!r} on attempt {attempt}")
                 return
@@ -1341,11 +1404,17 @@ def main():
 
                     # Auto-compute & inject timings (PB, start, device)
                     compute_and_apply_timings(racers)
+
+                    # If scratch distance, offer one-shot global offset
+                    sp = start_points.get(distance)
+                    if sp and not sp.get("has_lanes"):
+                        override_scratch_offset(distance, racers)
+
                     print("✅ Timings calculated and applied.")
                     input("Press ENTER to continue…")
         elif choice == '4':
             calculate_timings(racers)     # show the table
-            override_start_delays(racers) # allow edits
+            override_start_delays(racers) # allow edits (works for scratch or lanes)
         elif choice == '5':
             show_device_schedule(racers)
         elif choice == '6':
