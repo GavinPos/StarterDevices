@@ -640,7 +640,6 @@ def compute_and_apply_timings(racers):
                     racers[aid]['device'] = sp['device_assignments'].get(row['lane'], '-')
         else:
             # SCRATCH: racers have a shared start; devices handled in schedule builder
-            default_dev = sp['devices'][0] if sp.get('devices') else '-'
             for row in rows:
                 aid = row['id']
                 if aid in racers:
@@ -654,7 +653,8 @@ def compute_and_apply_timings(racers):
 
 def override_start_delays(racers):
     """
-    Allow the user to override 'start' values after Calculate/Compute Timings.
+    Allow the user to override 'start' values for *laned* events only.
+    For scratch events (no lanes), editing is disabled here by design.
     """
     from collections import defaultdict
     if not racers:
@@ -664,7 +664,10 @@ def override_start_delays(racers):
 
     while True:
         clear_screen()
-        grouped = defaultdict(list)  # dist -> list of (lane_key, aid)
+
+        grouped_laned = defaultdict(list)    # dist -> list of (lane_key, aid)
+        grouped_scratch = defaultdict(list)  # dist -> list of (dash, aid) for display only
+
         for dist, sp in start_points.items():
             if not sp.get("assignments"):
                 continue
@@ -673,31 +676,45 @@ def override_start_delays(racers):
                     lane_key = f"Lane {ln}"
                     aid = sp["assignments"].get(lane_key)
                     if aid and aid in racers and racers[aid].get("start_point") == dist:
-                        grouped[dist].append((lane_key, aid))
+                        grouped_laned[dist].append((lane_key, aid))
             else:
                 for aid in sp["assignments"].values():
                     if aid and aid in racers and racers[aid].get("start_point") == dist:
-                        grouped[dist].append(("-", aid))
+                        grouped_scratch[dist].append(("-", aid))
 
         index = []
-        print("✏️  Override Start Delays\n")
+        print("✏️  Override Start Delays (laned events only)\n")
         print("  • Pick athlete by NUMBER or ID to set an absolute start (seconds)")
         print("  • Or type:  all <±delta>        (e.g. all +0.20)")
         print("  • Or type:  dist <D> <±delta>   (e.g. dist 100 +0.10)")
         print("  • ENTER to finish\n")
 
+        # Show laned groups (editable)
         row_no = 1
-        for dist in sorted(grouped, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
-            print(f"=== {dist}m ===")
+        for dist in sorted(grouped_laned, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
+            print(f"=== {dist}m (laned) ===")
             print(f"{'#':<3}{'Lane':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Start(s)':<10}")
             print("-" * 61)
-            for lane_key, aid in grouped[dist]:
+            for lane_key, aid in grouped_laned[dist]:
                 r = racers[aid]
                 pb = r.get('pb', 0.0)
                 st = r.get('start', 0.0)
                 print(f"{row_no:<3}{lane_key:<8}{aid:<12}{r['name']:<20}{pb:<8.2f}{st:<10.2f}")
                 index.append((row_no, dist, lane_key, aid))
                 row_no += 1
+            print()
+
+        # Show scratch groups (read-only)
+        for dist in sorted(grouped_scratch, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
+            print(f"=== {dist}m (scratch — editing disabled in Option 4) ===")
+            print(f"{'':<3}{'Lane':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Start(s)':<10}")
+            print("-" * 61)
+            for lane_key, aid in grouped_scratch[dist]:
+                r = racers[aid]
+                pb = r.get('pb', 0.0)
+                st = r.get('start', 0.0)
+                print(f"{'':<3}{lane_key:<8}{aid:<12}{r['name']:<20}{pb:<8.2f}{st:<10.2f}")
+            print("  Tip: Set a global scratch offset during '3. Setup Race' flow.")
             print()
 
         sel = input("Select #/ID (or 'all +/-x.xx' / 'dist D +/-x.xx', ENTER to finish): ").strip()
@@ -714,7 +731,7 @@ def override_start_delays(racers):
                 continue
             for _, _, _, aid in index:
                 racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
-            print(f"✅ Applied {delta:+.2f}s to ALL starts.")
+            print(f"✅ Applied {delta:+.2f}s to ALL laned athletes.")
             time.sleep(0.8)
             continue
 
@@ -726,19 +743,23 @@ def override_start_delays(racers):
                 print("❌ Could not parse delta.")
                 time.sleep(0.8)
                 continue
+            if dist_key in grouped_scratch:
+                print("⚠️  That is a scratch event; editing is disabled here.")
+                time.sleep(0.9)
+                continue
             applied = 0
             for _, d, _, aid in index:
                 if d == dist_key:
                     racers[aid]['start'] = float(racers[aid].get('start', 0.0)) + delta
                     applied += 1
             if applied:
-                print(f"✅ Applied {delta:+.2f}s to {applied} athlete(s) in {dist_key}m.")
+                print(f"✅ Applied {delta:+.2f}s to {applied} athlete(s) in {dist_key}m (laned).")
             else:
-                print(f"⚠️  No athletes found for distance '{dist_key}'.")
+                print(f"⚠️  No laned athletes found for distance '{dist_key}'.")
             time.sleep(0.8)
             continue
 
-        # individual
+        # individual selection (laned only)
         aid_to_edit = None
         if sel.isdigit():
             num = int(sel)
@@ -747,11 +768,12 @@ def override_start_delays(racers):
                 aid_to_edit = match[3]
         else:
             cand = sel.upper()
-            if cand in athletes and cand in racers:
+            # Only allow if the athlete is part of a laned group
+            if any(aid == cand for _, _, _, aid in index):
                 aid_to_edit = cand
 
         if not aid_to_edit:
-            print("❌ Not a valid selection.")
+            print("❌ Not a valid (laned) selection.")
             time.sleep(0.8)
             continue
 
@@ -948,7 +970,6 @@ def build_device_schedule(racers):
             # SCRATCH: every device at this start point fires with identical timings
             dist_aids = [a for a, r in racers.items() if r.get('start_point') == dist]
             if dist_aids:
-                # Keep offsets stable relative to other distances, if any
                 dist_min = min(float(racers[a].get('start', 0.0)) for a in dist_aids)
             else:
                 dist_min = 0.0
@@ -1013,7 +1034,7 @@ def send_start_command(host="127.0.0.1", port=6000, payload=b"s"):
     try:
         for attempt in range(1, 6):
             try:
-                with socket.create_connection((host, port), timeout=0.2) as sock):
+                with socket.create_connection((host, port), timeout=0.2) as sock:
                     sock.sendall(payload)
                 print(f"✅ Sent {payload!r} on attempt {attempt}")
                 return
@@ -1405,7 +1426,7 @@ def main():
                     # Auto-compute & inject timings (PB, start, device)
                     compute_and_apply_timings(racers)
 
-                    # If scratch distance, offer one-shot global offset
+                    # If scratch distance, offer one-shot global offset (here, not in Option 4)
                     sp = start_points.get(distance)
                     if sp and not sp.get("has_lanes"):
                         override_scratch_offset(distance, racers)
@@ -1414,7 +1435,7 @@ def main():
                     input("Press ENTER to continue…")
         elif choice == '4':
             calculate_timings(racers)     # show the table
-            override_start_delays(racers) # allow edits (works for scratch or lanes)
+            override_start_delays(racers) # edits allowed only for laned events
         elif choice == '5':
             show_device_schedule(racers)
         elif choice == '6':
