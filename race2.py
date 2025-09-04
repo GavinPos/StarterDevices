@@ -233,7 +233,6 @@ def load_athletes(file_path=CSV_PATH):
                     try:
                         pbs[col] = float(sval)
                     except ValueError:
-                        # keep reading, just skip bad cell
                         pass
             athletes[aid] = {"name": name or aid, "pbs": pbs}
     return athletes
@@ -623,11 +622,38 @@ def calculate_timings(racers):
 
     return timing_data
 
+def compute_and_apply_timings(racers):
+    """
+    Compute timing rows (PB + headstarts) and inject into `racers`
+    without any UI. Mirrors the injection logic from calculate_timings().
+    """
+    timing_data = collect_start_point_timings(start_points, athletes)
+
+    for dist, rows in timing_data.items():
+        sp = start_points[dist]
+        if sp.get('has_lanes'):
+            for row in rows:
+                aid = row['id']
+                if aid in racers:
+                    racers[aid]['start']  = row['start']
+                    racers[aid]['pb']     = row['pb']
+                    racers[aid]['device'] = sp['device_assignments'].get(row['lane'], '-')
+        else:
+            default_dev = sp['devices'][0] if sp.get('devices') else '-'
+            for row in rows:
+                aid = row['id']
+                if aid in racers:
+                    racers[aid]['start']  = 0.0
+                    racers[aid]['pb']     = row['pb']
+                    racers[aid]['device'] = default_dev
+
+    return timing_data
+
 # ───────────────────────── Overrides & lane patterns ─────────────────────────
 
 def override_start_delays(racers):
     """
-    Allow the user to override 'start' values after Calculate Timings.
+    Allow the user to override 'start' values after Calculate/Compute Timings.
     """
     from collections import defaultdict
     if not racers:
@@ -876,6 +902,10 @@ def start_race_sequence(racers):
       • Send one START:<ID>{r,o,g,f}[@vol];… command
       • Let the Arduino print “STARTTIMER” when it fires
     """
+    # Ensure timings/device mapping exist (in case user skipped earlier steps)
+    if any(('start' not in r) or ('device' not in r) or ('pb' not in r) for r in racers.values()):
+        compute_and_apply_timings(racers)
+
     clear_screen()
     print("\n⏱️  Upcoming Command Sequence:")
     show_command_sequence(racers)
@@ -911,7 +941,7 @@ def start_race_sequence(racers):
             continue
         print(f"📡 {line}")
         if line == "STARTTIMER":
-            send_start_command() 
+            send_start_command()
             print("🚦 Race started!")
             break
 
@@ -1271,7 +1301,7 @@ def main():
         print("1. Devices")
         print("2. Setup Track")
         print("3. Setup Race")
-        print("4. Calculate Timings")
+        print("4. Review/Override Timings")
         print("5. Show Execution Times")
         print("6. Start Race")
         print("7. Enter Results")
@@ -1289,11 +1319,12 @@ def main():
                 distance = input("Distance for handicap calc (e.g. 100): ").strip()
                 if distance:
                     calculate_staggered_starts(racers, distance)
+
                     # Optional: choose lane pattern if laned
                     if distance in start_points and start_points[distance].get("has_lanes"):
                         while True:
                             print("\nLane pattern options:")
-                            print("  1) Outside-in (slowest to [1, N, 2, N-1, ...])")
+                            print("  1) Outside-in (slowest → lanes [1, N, 2, N-1, ...])")
                             print("  2) Left-to-right (slowest..fastest → lanes 1..N)")
                             print("ENTER to skip")
                             pat = input("Choose pattern: ").strip()
@@ -1307,10 +1338,14 @@ def main():
                                 break
                             else:
                                 print("❌ Invalid choice.")
+
+                    # Auto-compute & inject timings (PB, start, device)
+                    compute_and_apply_timings(racers)
+                    print("✅ Timings calculated and applied.")
+                    input("Press ENTER to continue…")
         elif choice == '4':
-            calculate_timings(racers)
-            # NEW: let the user override computed starts
-            override_start_delays(racers)
+            calculate_timings(racers)     # show the table
+            override_start_delays(racers) # allow edits
         elif choice == '5':
             show_device_schedule(racers)
         elif choice == '6':
