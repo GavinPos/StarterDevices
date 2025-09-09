@@ -4,6 +4,7 @@ import time
 import serial
 import serial.tools.list_ports
 import socket
+from decimal import Decimal, ROUND_HALF_UP  # ← for 0.1s HALF_UP rounding
 
 CSV_PATH = "data/athletes.csv"
 CSV_PATH2 = "data/athletes2.csv"   # kept for compatibility; not required
@@ -22,6 +23,12 @@ ser = None
 # Volume management
 default_volume = None        # None or int 0..30
 device_volumes = {}          # {'03': 18, '07': 25, ...}
+
+# ───────────────────────── Rounding helper ─────────────────────────
+
+def round_tenth(x: float) -> float:
+    """Round to nearest 0.1s with HALF_UP behavior (e.g., 1.05 -> 1.1)."""
+    return float(Decimal(str(x)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
 
 # ───────────────────────── Serial helpers ─────────────────────────
 
@@ -925,7 +932,7 @@ def show_command_sequence(racers):
     print("-" * 28)
     for t, dev, cmd in events:
         action = code_map.get(cmd, cmd)
-        print(f"{t:>7.2f}  {dev:<12} {action}")
+        print(f"{t:>7.1f}  {dev:<12} {action}")  # ← show tenths
 
 def build_device_schedule(racers):
     """
@@ -983,7 +990,7 @@ def start_race_sequence(racers):
     """
     Uses the transmitter’s START:… model:
       • Compute each device’s [red, orange, green, off] offsets
-      • Send one START:<ID>{r,o,g,f}[@vol];… command
+      • Send one START:<ID>{r,o,g,f}[@vol];… command (now as tenths)
       • Let the Arduino print “STARTTIMER” when it fires
     """
     # Ensure timings/device mapping exist (in case user skipped earlier steps)
@@ -1000,12 +1007,14 @@ def start_race_sequence(racers):
     sched = build_device_schedule(racers)
     entries = []
     for dev, times in sched.items():
-        r = int(round(times['red_on']))
-        o = int(round(times['orange_on']))
-        g = int(round(times['green_on']))
-        f = int(round(times['green_off']))
+        # ← round to nearest 0.1s, HALF_UP, and format with exactly one decimal
+        r = round_tenth(times['red_on'])
+        o = round_tenth(times['orange_on'])
+        g = round_tenth(times['green_on'])
+        f = round_tenth(times['green_off'])
         vol = device_volumes.get(dev, default_volume)
-        entry = f"{dev}{{{r},{o},{g},{f}}}"
+
+        entry = f"{dev}{{{r:.1f},{o:.1f},{g:.1f},{f:.1f}}}"
         if isinstance(vol, int):
             entry += f"@{vol}"
         entries.append(entry)
@@ -1077,7 +1086,7 @@ def show_device_schedule(racers):
         green_start = times['green_on']
         print(
             f"{dev:<8}{distance:<10}{lane:<8}"
-            f"{red_start:<10.2f}{orange_start:<12.2f}{green_start:<10.2f}"
+            f"{red_start:<10.1f}{orange_start:<12.1f}{green_start:<10.1f}"  # ← show tenths
         )
     input("\nPress ENTER to continue...")
 
