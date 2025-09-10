@@ -4,7 +4,7 @@ import time
 import serial
 import serial.tools.list_ports
 import socket
-from decimal import Decimal, ROUND_HALF_UP  # ← for 0.1s HALF_UP rounding
+from decimal import Decimal, ROUND_HALF_UP  # for 0.1s HALF_UP rounding
 
 CSV_PATH = "data/athletes.csv"
 CSV_PATH2 = "data/athletes2.csv"   # kept for compatibility; not required
@@ -23,6 +23,10 @@ ser = None
 # Volume management
 default_volume = None        # None or int 0..30
 device_volumes = {}          # {'03': 18, '07': 25, ...}
+
+# Per-device schedule overrides (tenths). Example:
+# {'03': {'red_on': 5.1, 'orange_on': 7.1, 'green_on': 9.2, 'green_off': 11.0}, ...}
+device_time_overrides = {}
 
 # ───────────────────────── Rounding helper ─────────────────────────
 
@@ -660,8 +664,8 @@ def compute_and_apply_timings(racers):
 
 def override_start_delays(racers):
     """
-    Allow the user to override 'start' values for *laned* events only.
-    For scratch events (no lanes), editing is disabled here by design.
+    (Legacy lane-start editor.) Kept for reference; Option 4 now uses
+    review_override_timings() to edit per-device schedules.
     """
     from collections import defaultdict
     if not racers:
@@ -672,8 +676,8 @@ def override_start_delays(racers):
     while True:
         clear_screen()
 
-        grouped_laned = defaultdict(list)    # dist -> list of (lane_key, aid)
-        grouped_scratch = defaultdict(list)  # dist -> list of (dash, aid) for display only
+        grouped_laned = defaultdict(list)
+        grouped_scratch = defaultdict(list)
 
         for dist, sp in start_points.items():
             if not sp.get("assignments"):
@@ -696,7 +700,6 @@ def override_start_delays(racers):
         print("  • Or type:  dist <D> <±delta>   (e.g. dist 100 +0.10)")
         print("  • ENTER to finish\n")
 
-        # Show laned groups (editable)
         row_no = 1
         for dist in sorted(grouped_laned, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
             print(f"=== {dist}m (laned) ===")
@@ -711,7 +714,6 @@ def override_start_delays(racers):
                 row_no += 1
             print()
 
-        # Show scratch groups (read-only)
         for dist in sorted(grouped_scratch, key=lambda x: float(x) if x.replace('.','',1).isdigit() else x):
             print(f"=== {dist}m (scratch — editing disabled in Option 4) ===")
             print(f"{'':<3}{'Lane':<8}{'Athlete ID':<12}{'Name':<20}{'PB(s)':<8}{'Start(s)':<10}")
@@ -750,10 +752,6 @@ def override_start_delays(racers):
                 print("❌ Could not parse delta.")
                 time.sleep(0.8)
                 continue
-            if dist_key in grouped_scratch:
-                print("⚠️  That is a scratch event; editing is disabled here.")
-                time.sleep(0.9)
-                continue
             applied = 0
             for _, d, _, aid in index:
                 if d == dist_key:
@@ -766,7 +764,6 @@ def override_start_delays(racers):
             time.sleep(0.8)
             continue
 
-        # individual selection (laned only)
         aid_to_edit = None
         if sel.isdigit():
             num = int(sel)
@@ -775,7 +772,6 @@ def override_start_delays(racers):
                 aid_to_edit = match[3]
         else:
             cand = sel.upper()
-            # Only allow if the athlete is part of a laned group
             if any(aid == cand for _, _, _, aid in index):
                 aid_to_edit = cand
 
@@ -844,10 +840,14 @@ def _lane_sequence_left_to_right(num_lanes):
 def apply_handicap_lane_pattern(distance, racers, pattern="outside_in"):
     """
     Reorders lane assignments for a laned start point based on computed 'start' values.
+
     pattern:
-      • "outside_in"     → slowest to fastest mapped to [1, N, 2, N-1, ...]
+      • "outside_in"     → slowest..fastest mapped to [1, N, 2, N-1, ...]
       • "left_to_right"  → slowest..fastest mapped to [1, 2, 3, ..., N]
-    Displays the new mapping.
+
+    NOTE: In this app, 'start' = slowest_pb - pb, so:
+          faster athlete → smaller pb → larger 'start' value.
+          Therefore, to place slowest first we sort by 'start' ASC.
     """
     if distance not in start_points:
         print(f"⚠️  Distance {distance} not defined in start points.")
@@ -871,11 +871,11 @@ def apply_handicap_lane_pattern(distance, racers, pattern="outside_in"):
         input("Press ENTER…")
         return
 
-    # sort by start descending (largest headstart = slowest), tiebreak by PB desc
+    # ✅ sort slowest→fastest: 'start' ASC (smaller headstart = slower)
+    # tie-break: higher PB (slower) first if starts equal
     sorted_aids = sorted(
         current,
-        key=lambda a: (racers[a].get("start", 0.0), racers[a].get("pb", 0.0)),
-        reverse=True
+        key=lambda a: (racers[a].get("start", 0.0), -racers[a].get("pb", 0.0))
     )
 
     if pattern == "outside_in":
@@ -883,7 +883,7 @@ def apply_handicap_lane_pattern(distance, racers, pattern="outside_in"):
     else:
         lane_order = _lane_sequence_left_to_right(sp["num_lanes"])
 
-    # map athletes to lane order; ignore extra lanes, or if more athletes than lanes, truncate
+    # map athletes to lane order; ignore extra lanes, or truncate if more athletes than lanes
     sp["assignments"].clear()
     pairs = []
     for idx, aid in enumerate(sorted_aids):
@@ -906,7 +906,24 @@ def apply_handicap_lane_pattern(distance, racers, pattern="outside_in"):
         print(f"{lane:<6}{aid:<12}{r['name']:<22}{pb:<10.2f}{st:<8.2f}")
     input("\nPress ENTER to continue…")
 
+
 # ───────────────────────── Command sequence & RF start ─────────────────────────
+
+def _device_lane_binding(dev_id):
+    """
+    Returns (distance_str, lane_key) if this device is assigned to a lane,
+    or (distance_str, None) if assigned to a scratch start point,
+    or (None, None) if unassigned.
+    """
+    for dist, sp in start_points.items():
+        if sp.get('has_lanes'):
+            for ln, d in sp.get('device_assignments', {}).items():
+                if d == dev_id:
+                    return (dist, ln)  # editable in Option 4
+        else:
+            if dev_id in sp.get('devices', []):
+                return (dist, None)   # scratch → read-only in Option 4
+    return (None, None)
 
 def show_command_sequence(racers):
     if not racers:
@@ -932,7 +949,7 @@ def show_command_sequence(racers):
     print("-" * 28)
     for t, dev, cmd in events:
         action = code_map.get(cmd, cmd)
-        print(f"{t:>7.1f}  {dev:<12} {action}")  # ← show tenths
+        print(f"{t:>7.1f}  {dev:<12} {action}")  # show tenths
 
 def build_device_schedule(racers):
     """
@@ -984,6 +1001,24 @@ def build_device_schedule(racers):
             for dev in sp.get('devices', []):
                 schedule[dev] = _times_from_red_on(red_on)
 
+    # ── Apply per-device overrides (rounded to tenths, HALF_UP) ──
+    for dev, ov in device_time_overrides.items():
+        if dev in schedule:
+            base = schedule[dev]
+            # keep phase durations; shift "on" times; set off from green_off
+            r = round_tenth(ov.get('red_on',     base['red_on']))
+            o = round_tenth(ov.get('orange_on',  base['orange_on']))
+            g = round_tenth(ov.get('green_on',   base['green_on']))
+            f = round_tenth(ov.get('green_off',  base['green_off']))
+            schedule[dev] = {
+                'red_on': r,
+                'red_off': r + (base['red_off'] - base['red_on']),
+                'orange_on': o,
+                'orange_off': o + (base['orange_off'] - base['orange_on']),
+                'green_on': g,
+                'green_off': f
+            }
+
     return schedule
 
 def start_race_sequence(racers):
@@ -1007,7 +1042,7 @@ def start_race_sequence(racers):
     sched = build_device_schedule(racers)
     entries = []
     for dev, times in sched.items():
-        # ← round to nearest 0.1s, HALF_UP, and format with exactly one decimal
+        # round to nearest 0.1s, HALF_UP, and format with exactly one decimal
         r = round_tenth(times['red_on'])
         o = round_tenth(times['orange_on'])
         g = round_tenth(times['green_on'])
@@ -1086,9 +1121,182 @@ def show_device_schedule(racers):
         green_start = times['green_on']
         print(
             f"{dev:<8}{distance:<10}{lane:<8}"
-            f"{red_start:<10.1f}{orange_start:<12.1f}{green_start:<10.1f}"  # ← show tenths
+            f"{red_start:<10.1f}{orange_start:<12.1f}{green_start:<10.1f}"  # show tenths
         )
     input("\nPress ENTER to continue...")
+
+# ───────────────────────── Option 4: Review/Override the per-device schedule ─────────────────────────
+
+def review_override_timings(racers):
+    """
+    Show the same schedule as 'Show Execution Times' (Option 5),
+    rounded to 0.1s, and allow editing per-device timings for laned events.
+    Scratch assignments remain read-only here.
+    """
+    from collections import OrderedDict
+
+    if not racers:
+        print("ℹ️  No race loaded. Setup race first.")
+        input("Press ENTER to continue…")
+        return
+
+    while True:
+        clear_screen()
+        sched = build_device_schedule(racers)
+
+        # Build rows with dist/lane context
+        rows = []
+        for dev in sorted(sched.keys(), key=lambda x: int(x)):
+            dist, lane_key = _device_lane_binding(dev)
+            times = sched[dev]
+            rows.append(OrderedDict([
+                ("dev", dev),
+                ("dist", f"{dist}m" if dist else "-"),
+                ("lane", lane_key if lane_key else ("-" if dist else "-")),
+                ("r", round_tenth(times['red_on'])),
+                ("o", round_tenth(times['orange_on'])),
+                ("g", round_tenth(times['green_on'])),
+                ("f", round_tenth(times['green_off'])),
+                ("editable", lane_key is not None)   # only laned devices editable
+            ]))
+
+        # Print table
+        print("✏️  Review / Override Timings (per device; tenths)\n")
+        print(f"{'#':<3}{'Device':<8}{'Distance':<10}{'Lane':<10}{'Red(s)':<8}{'Orange(s)':<10}{'Green(s)':<10}{'Off(s)':<8}{'Edit?'}")
+        print("-" * 76)
+        idx_map = {}
+        for i, r in enumerate(rows, 1):
+            print(f"{i:<3}{r['dev']:<8}{r['dist']:<10}{r['lane']:<10}{r['r']:<8.1f}{r['o']:<10.1f}{r['g']:<10.1f}{r['f']:<8.1f}{'Yes' if r['editable'] else 'No'}")
+            idx_map[str(i)] = r
+
+        print("\nCommands:")
+        print("  • <#>|<DEV>           → edit that device (laned only)")
+        print("  • shift <#|DEV> +/-x  → shift all four times by delta (e.g., shift 3 +0.2)")
+        print("  • reset <#|DEV>       → clear override for that device")
+        print("  • all +/-x            → shift ALL laned devices by delta (e.g., all -0.1)")
+        print("  • clear               → clear ALL overrides")
+        print("  • ENTER               → go back\n")
+
+        cmd = input("Command: ").strip()
+        if cmd == "":
+            break
+
+        parts = cmd.split()
+        get_row = lambda key: (idx_map.get(key) or next((r for r in rows if r['dev'] == key), None))
+
+        # clear all
+        if len(parts) == 1 and parts[0].lower() == "clear":
+            device_time_overrides.clear()
+            print("↺ Cleared ALL overrides.")
+            time.sleep(0.7)
+            continue
+
+        # all +/-delta
+        if len(parts) == 2 and parts[0].lower() == "all":
+            try:
+                delta = float(parts[1])
+            except ValueError:
+                print("❌ Bad delta.")
+                time.sleep(0.7)
+                continue
+            applied = 0
+            for r in rows:
+                if not r['editable']:
+                    continue
+                dev = r['dev']
+                ov = {
+                    'red_on':    round_tenth(r['r'] + delta),
+                    'orange_on': round_tenth(r['o'] + delta),
+                    'green_on':  round_tenth(r['g'] + delta),
+                    'green_off': round_tenth(r['f'] + delta),
+                }
+                device_time_overrides[dev] = ov
+                applied += 1
+            print(f"✅ Shifted {applied} device(s) by {delta:+.1f}s.")
+            time.sleep(0.8)
+            continue
+
+        # reset single
+        if len(parts) == 2 and parts[0].lower() == "reset":
+            row = get_row(parts[1])
+            if not row:
+                print("❌ Not found.")
+                time.sleep(0.7)
+                continue
+            dev = row['dev']
+            if dev in device_time_overrides:
+                del device_time_overrides[dev]
+                print(f"↺ Cleared override for DEV{dev}.")
+            else:
+                print("ℹ️  No override set.")
+            time.sleep(0.7)
+            continue
+
+        # shift single
+        if len(parts) == 3 and parts[0].lower() == "shift":
+            row = get_row(parts[1])
+            if not row:
+                print("❌ Not found.")
+                time.sleep(0.7)
+                continue
+            if not row['editable']:
+                print("⚠️  Scratch device — editing disabled here.")
+                time.sleep(0.8)
+                continue
+            try:
+                delta = float(parts[2])
+            except ValueError:
+                print("❌ Bad delta.")
+                time.sleep(0.7)
+                continue
+            dev = row['dev']
+            ov = {
+                'red_on':    round_tenth(row['r'] + delta),
+                'orange_on': round_tenth(row['o'] + delta),
+                'green_on':  round_tenth(row['g'] + delta),
+                'green_off': round_tenth(row['f'] + delta),
+            }
+            device_time_overrides[dev] = ov
+            print(f"✅ DEV{dev} shifted by {delta:+.1f}s.")
+            time.sleep(0.8)
+            continue
+
+        # edit single device: "<#>" or "<DEV>"
+        if len(parts) == 1:
+            row = get_row(parts[0])
+            if not row:
+                print("❌ Not found.")
+                time.sleep(0.7)
+                continue
+            if not row['editable']:
+                print("⚠️  Scratch device — editing disabled here.")
+                time.sleep(0.9)
+                continue
+
+            dev = row['dev']
+            print(f"\nEditing DEV{dev} ({row['dist']} Lane {row['lane']}) — enter new values or ENTER to keep")
+            def _ask(label, cur):
+                s = input(f"  {label} [{cur:.1f}]: ").strip()
+                if s == "":
+                    return cur
+                try:
+                    return round_tenth(float(s))
+                except ValueError:
+                    print("   ❌ Invalid number; keeping current.")
+                    return cur
+
+            r = _ask("Red(s)",    row['r'])
+            o = _ask("Orange(s)", row['o'])
+            g = _ask("Green(s)",  row['g'])
+            f = _ask("Off(s)",    row['f'])
+
+            device_time_overrides[dev] = {'red_on': r, 'orange_on': o, 'green_on': g, 'green_off': f}
+            print(f"\n✅ DEV{dev} override set → R:{r:.1f} O:{o:.1f} G:{g:.1f} F:{f:.1f}")
+            time.sleep(0.9)
+            continue
+
+        print("❌ Unrecognized command.")
+        time.sleep(0.7)
 
 # ───────────────────────── Results & persistence ─────────────────────────
 
@@ -1443,8 +1651,8 @@ def main():
                     print("✅ Timings calculated and applied.")
                     input("Press ENTER to continue…")
         elif choice == '4':
-            calculate_timings(racers)     # show the table
-            override_start_delays(racers) # edits allowed only for laned events
+            # Show/edit the same data type as Option 5 (device execution schedule, tenths)
+            review_override_timings(racers)
         elif choice == '5':
             show_device_schedule(racers)
         elif choice == '6':
