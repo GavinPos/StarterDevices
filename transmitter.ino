@@ -1,36 +1,44 @@
+// ───────────────── Transmitter (binary START) ─────────────────
+// Keep your existing includes
 #include <SPI.h>
 #include <RF24.h>
+#include "Packets.h"   // ← the shared structs above
 
 RF24 radio(9, 10);  // CE, CSN
 
-static const byte slaveAddrs[][6] = { "DEV00","DEV01","DEV02","DEV03","DEV04","DEV05","DEV06","DEV07" };
+static const byte slaveAddrs[][6] = {
+  "DEV00","DEV01","DEV02","DEV03","DEV04","DEV05","DEV06","DEV07"
+};
 const int NUM_SLAVES = 8;
 
 unsigned long startDelaySec = 2;
-
-// Default volume (0..30) if a device block omits @<vol>
 uint8_t deviceVolume = 20;
 
-// New: sequence id (advance once per START batch)
 static uint16_t seqId = 1;
-static uint8_t flashSeq = 0;
+static uint8_t  flashSeq = 0;
+
+void txBeginTo(int idx) {
+  radio.stopListening();
+  radio.openWritingPipe(slaveAddrs[idx]);
+  radio.flush_tx();
+}
+void txEnd() { radio.startListening(); }
 
 void setup() {
   Serial.begin(115200);
-  radio.begin();
+  while (!Serial) {}
 
-  // ---- Robust RF config ----
-  radio.setPALevel(RF24_PA_MAX);         // use RF24_PA_LOW for close bench tests
+  radio.begin();
+  radio.setPALevel(RF24_PA_MAX);
   radio.setAutoAck(true);
-  radio.setRetries(5, 15);               // 5 retries, 15*250us backoff
-  radio.setDataRate(RF24_250KBPS);       // best sensitivity
-  radio.setChannel(108);                 // ~2.508 GHz (less Wi-Fi overlap)
+  radio.setRetries(5, 15);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setChannel(108);
   radio.setCRCLength(RF24_CRC_16);
   radio.enableDynamicPayloads();
   radio.enableAckPayload();
 
-  // Start in RX by default (TX switches per send)
-  radio.openReadingPipe(0, slaveAddrs[0]); // not used for TX, but keeps state sane
+  radio.openReadingPipe(0, slaveAddrs[0]); // keep state sane
   radio.startListening();
 }
 
@@ -48,19 +56,14 @@ void loop() {
 
       if (strcasecmp(buf, "DISCOVER") == 0) {
         for (int i = 0; i < NUM_SLAVES; i++) { checkSlave(i); delay(10); }
-      }
-      else if (strcasecmp(buf, "SYNC") == 0) {
+      } else if (strcasecmp(buf, "SYNC") == 0) {
         for (int i = 0; i < NUM_SLAVES; i++) { sendSync(i); delay(10); }
-      }
-      else if (strcasecmp(buf, "FLASH") == 0) {
+      } else if (strcasecmp(buf, "FLASH") == 0) {
         for (int i = 0; i < NUM_SLAVES; i++) { sendFlash(i); delay(10); }
-      }
-      else if (strncasecmp(buf, "START:", 6) == 0) {
-        handleMultiStart(buf + 6);
-      }
-      else if (strncasecmp(buf, "VOLUME:", 7) == 0) {
-        int v = atoi(buf + 7);
-        if (v < 0) v = 0; if (v > 30) v = 30;
+      } else if (strncasecmp(buf, "START:", 6) == 0) {
+        handleMultiStartBinary(buf + 6);           // <<<<<<<<<< binary path
+      } else if (strncasecmp(buf, "VOLUME:", 7) == 0) {
+        int v = atoi(buf + 7); if (v<0) v=0; if (v>30) v=30;
         deviceVolume = (uint8_t)v;
         Serial.print("Default volume set to "); Serial.println(deviceVolume);
       }
@@ -70,40 +73,27 @@ void loop() {
   }
 }
 
-// ───────────────── helpers ─────────────────
-
-void txBeginTo(int idx) {
-  radio.stopListening();
-  radio.openWritingPipe(slaveAddrs[idx]);
-  radio.flush_tx();
-}
-
-void txEnd() {
-  radio.startListening();
-}
+// ───────────── helpers you already had (mostly unchanged) ─────────────
 
 void checkSlave(int idx) {
   txBeginTo(idx);
   bool ok = false;
   for (int attempt = 0; attempt < 5; ++attempt) {
-    ok = radio.write("CHECK", 6); // include NUL doesn't matter here
+    ok = radio.write("CHECK", 6);
     if (ok) break;
     delay(10);
   }
   txEnd();
-
   Serial.print("CHECK "); Serial.print((char*)slaveAddrs[idx]);
-  Serial.print(ok ? " ACKed" : " FAILED");
-  Serial.println();
+  Serial.println(ok ? " ACKed" : " FAILED");
 }
 
 void sendSync(int idx) {
   unsigned long masterMicros = micros();
-  char buf[32];
-  snprintf(buf, sizeof(buf), "SYNC:%lu", masterMicros);
-
+  char sbuf[32];
+  snprintf(sbuf, sizeof(sbuf), "SYNC:%lu", masterMicros);
   txBeginTo(idx);
-  bool ok = radio.write(buf, strlen(buf) + 1);
+  bool ok = radio.write(sbuf, strlen(sbuf) + 1);
   txEnd();
 
   Serial.print("SYNC  "); Serial.print((char*)slaveAddrs[idx]);
@@ -111,8 +101,23 @@ void sendSync(int idx) {
   Serial.print(" @"); Serial.println(masterMicros);
 }
 
-bool pollReadyAck(int idx, uint16_t expectSeq) {
-  // Send a tiny ping to solicit the preloaded ACK payload from RX
+void sendFlash(int idx) {
+  char pkt[16];
+  snprintf(pkt, sizeof(pkt), "FLASH:%u", (unsigned)flashSeq++);
+  txBeginTo(idx);
+  bool ok = false;
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    ok = radio.write(pkt, strlen(pkt) + 1);
+    if (ok) break;
+    delay(5);
+  }
+  txEnd();
+  Serial.print("FLASH "); Serial.print((char*)slaveAddrs[idx]);
+  Serial.println(ok ? " OK" : " FAIL");
+}
+
+bool pollReadyAckBinary(int idx, uint16_t expectSeq) {
+  // Send a tiny ping (string is fine) to solicit ACK payload
   char ping[16];
   snprintf(ping, sizeof(ping), "PING:%u", (unsigned)expectSeq);
 
@@ -121,94 +126,31 @@ bool pollReadyAck(int idx, uint16_t expectSeq) {
   bool ready = false;
 
   if (ok && radio.isAckPayloadAvailable()) {
-    char ack[32] = {0};
+    ReadyAckV1 ack{};
     radio.read(&ack, sizeof(ack));
-    unsigned ackSeq = 0;
-    if (sscanf(ack, "RDY:%u", &ackSeq) == 1 && ackSeq == expectSeq) {
-      ready = true;
-    }
+    if (ack.type == MSG_READY_V1 && ack.seq == expectSeq) ready = true;
   }
   txEnd();
   return ready;
 }
 
-// UPDATED: now includes seq + per-device volume and READY polling
-void sendStartSequence(int idx, const char *stepList, unsigned long masterStartTime, uint8_t vol) {
-  sendSync(idx);
-  // Build ST2 packet: ST2:<seq>|<t0|t1|...>:<masterStart>:<vol>
-  char buf[128] = "ST2:";
-
-  char seqStr[12];
-  snprintf(seqStr, sizeof(seqStr), "%u|", (unsigned)seqId);
-  strncat(buf, seqStr, sizeof(buf)-strlen(buf)-1);
-
-  strncat(buf, stepList, sizeof(buf) - strlen(buf) - 1);
-
-  char tail[48];
-  if (vol > 30) vol = 30;
-  snprintf(tail, sizeof(tail), ":%lu:%u", masterStartTime, (unsigned)vol);
-  strncat(buf, tail, sizeof(buf) - strlen(buf) - 1);
-
-  // Send ST2
-  txBeginTo(idx);
-  bool ok = radio.write(buf, strlen(buf) + 1);
-  txEnd();
- 
-  Serial.print("START "); Serial.print((char*)slaveAddrs[idx]);
-  Serial.print(ok ? " TXOK " : " TXFAIL ");
-  Serial.print("Payload='"); Serial.print(buf); Serial.println("'");
-
-  // If ST2 went through, immediately poll for READY via ack payload
-  bool ready = false;
-  if (ok) {
-    // try up to 3 polls with small jittered backoff
-    for (int attempt = 0; attempt < 3 && !ready; ++attempt) {
-      delay(15 + (idx * 7 + attempt * 11) % 20);
-      ready = pollReadyAck(idx, seqId);
-    }
-  }
-  Serial.print("READY "); Serial.print((char*)slaveAddrs[idx]);
-  Serial.println(ready ? " YES" : " NO");
-}
-
-void sendFlash(int idx) {
-  char pkt[16];
-  snprintf(pkt, sizeof(pkt), "FLASH:%u", (unsigned)flashSeq++);  // "FLASH:0", "FLASH:1", ...
-
-  radio.openWritingPipe(slaveAddrs[idx]);
-  radio.stopListening();
-  radio.flush_tx();
-
-  bool ok = false;
-  for (int attempt = 0; attempt < 5; ++attempt) {
-    ok = radio.write(pkt, strlen(pkt) + 1);
-    if (ok) break;
-    delay(5);
-  }
-  radio.startListening();
-
-  Serial.print("FLASH "); Serial.print((char*)slaveAddrs[idx]);
-  Serial.println(ok ? " OK" : " FAIL");
-}
-
-// Handles START:00{0,2,5}@18;01{1,4,6}@22;...
-void handleMultiStart(const char *input) {
-  // compute when “time zero” is (master time + delay)
+// ───────────── Binary START: console → packet per device ─────────────
+// Accepts your existing console format per device: 00{r,o,g,f}@18;01{...};...
+// r/o/g/f may be decimal strings like "1.1,3.2,5.3,7.4"
+void handleMultiStartBinary(const char *input) {
   unsigned long masterStartTime = micros() + startDelaySec * 1000000UL;
   Serial.print("Master Start Time: "); Serial.println(masterStartTime);
 
-  // make a mutable copy of the command string
   char buf[160];
   strncpy(buf, input, sizeof(buf));
   buf[sizeof(buf)-1] = '\0';
 
   unsigned long earliestGreenTime = 0xFFFFFFFFUL;
 
-  // ─── outer split on “;”
   char *saveptr1;
   char *entry = strtok_r(buf, ";", &saveptr1);
   while (entry) {
-    while (*entry == ' ') entry++;
+    while (*entry==' '||*entry=='\t') entry++;
 
     char *openBrace  = strchr(entry, '{');
     char *closeBrace = strchr(entry, '}');
@@ -219,62 +161,88 @@ void handleMultiStart(const char *input) {
     }
 
     char idStr[3] = { entry[0], entry[1], '\0' };
-    int  id       = atoi(idStr);
+    int  id = atoi(idStr);
     if (id < 0 || id >= NUM_SLAVES) {
       Serial.print("Invalid ID: "); Serial.println(idStr);
       entry = strtok_r(NULL, ";", &saveptr1);
       continue;
     }
 
-    // copy steps between braces as raw (comma-separated)
+    // Extract r,o,g,f as decimals
     char rawSteps[64];
     int  rawLen = closeBrace - openBrace - 1;
+    if (rawLen < 0) rawLen = 0;
+    if ((size_t)rawLen >= sizeof(rawSteps)) rawLen = sizeof(rawSteps) - 1;
     strncpy(rawSteps, openBrace + 1, rawLen);
     rawSteps[rawLen] = '\0';
 
-    // Convert to pipe-separated
-    char pipeSteps[64];
-    strncpy(pipeSteps, rawSteps, sizeof(pipeSteps));
-    pipeSteps[sizeof(pipeSteps)-1] = '\0';
-    for (int i = 0; pipeSteps[i]; i++) {
-      if (pipeSteps[i] == ',') pipeSteps[i] = '|';
+    double tSec[4] = {0,0,0,0};
+    uint8_t steps = 0;
+    {
+      char tmp[64]; strncpy(tmp, rawSteps, sizeof(tmp)); tmp[sizeof(tmp)-1]='\0';
+      char *sp2; char *tok = strtok_r(tmp, ",", &sp2);
+      while (tok && steps < 4) {
+        tSec[steps++] = atof(tok);
+        tok = strtok_r(NULL, ",", &sp2);
+      }
     }
+    if (steps < 3) { Serial.println("Need at least red,orange,green"); entry = strtok_r(NULL, ";", &saveptr1); continue; }
 
-    // optional "@vol"
+    // Optional @vol
     uint8_t volForThis = deviceVolume;
     char *afterBrace = closeBrace + 1;
-    while (*afterBrace == ' ' || *afterBrace == '\t') afterBrace++;
+    while (*afterBrace==' '||*afterBrace=='\t') afterBrace++;
     if (*afterBrace == '@') {
       int v = atoi(afterBrace + 1);
       if (v < 0) v = 0; if (v > 30) v = 30;
       volForThis = (uint8_t)v;
     }
 
-    // find the 3rd (green) value to compute earliest green time
-    char rawCopy[64];
-    strncpy(rawCopy, rawSteps, sizeof(rawCopy)); rawCopy[sizeof(rawCopy)-1] = '\0';
-    char *saveptr2; char *tok = strtok_r(rawCopy, ",", &saveptr2);
-    int idxTok = 0, greenOffset = -1;
-    while (tok) {
-      if (idxTok == 2) { greenOffset = atoi(tok); break; }
-      tok = strtok_r(NULL, ",", &saveptr2); idxTok++;
-    }
-    if (greenOffset >= 0) {
-      unsigned long gtime = masterStartTime + (unsigned long)greenOffset * 1000000UL;
-      if (gtime < earliestGreenTime) earliestGreenTime = gtime;
+    // Convert to deciseconds (0.1 s), HALF_UP
+    StartPacketV1 pkt{};
+    pkt.type        = MSG_START_V1;
+    pkt.seq         = seqId;
+    pkt.masterStart = masterStartTime;
+    pkt.volume      = volForThis;
+    pkt.steps       = steps;
+    for (uint8_t i=0;i<steps;i++) {
+      uint16_t ds = (uint16_t) (tSec[i] * 10.0 + 0.5); // round to nearest 0.1
+      pkt.t_ds[i] = ds;
     }
 
-    delay(5);
-    sendStartSequence(id, pipeSteps, masterStartTime, volForThis);
-    delay(10);
+    // Track earliest green for host "STARTTIMER"
+    unsigned long gtime = masterStartTime + (unsigned long)(tSec[2] * 1000000.0);
+    if (gtime < earliestGreenTime) earliestGreenTime = gtime;
+
+    // Send to device
+    txBeginTo(id);
+    bool ok = radio.write(&pkt, sizeof(pkt));
+    txEnd();
+
+    Serial.print("START_BIN "); Serial.print((char*)slaveAddrs[id]);
+    Serial.print(ok ? " TXOK " : " TXFAIL ");
+    Serial.print(" bytes="); Serial.print(sizeof(pkt));
+    Serial.print(" seq="); Serial.print(pkt.seq);
+    Serial.print(" vol="); Serial.print(pkt.volume);
+    Serial.print(" tds=[");
+    for (uint8_t i=0;i<steps;i++){ Serial.print(pkt.t_ds[i]); if(i+1<steps)Serial.print(','); }
+    Serial.println("]");
+
+    bool ready = false;
+    if (ok) {
+      for (int attempt=0; attempt<3 && !ready; ++attempt) {
+        delay(15 + (id * 7 + attempt * 11) % 20);
+        ready = pollReadyAckBinary(id, pkt.seq);
+      }
+    }
+    Serial.print("READY "); Serial.print((char*)slaveAddrs[id]);
+    Serial.println(ready ? " YES" : " NO");
 
     entry = strtok_r(NULL, ";", &saveptr1);
   }
 
-  // bump sequence id once per batch
   seqId++;
 
-  // fire the very first green marker for host app
   if (earliestGreenTime != 0xFFFFFFFFUL) {
     while ((long)(micros() - earliestGreenTime) < 0) { delay(1); }
     Serial.println("STARTTIMER");
