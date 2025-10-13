@@ -5,7 +5,7 @@
 #include "Packets.h"   // ← the shared structs
 
 RF24 radio(9, 10);               // CE, CSN
-static const byte thisDeviceAddr[6] = "DEV03";
+static const byte thisDeviceAddr[6] = "DEV01";
 
 // LEDs
 const int RED_LED=5, ORANGE_LED=6, GREEN_LED=7;
