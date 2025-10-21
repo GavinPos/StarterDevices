@@ -1,56 +1,45 @@
 // ───────────────────────────────────────────────────────────────
 //  Reliable Multi-Device Transmitter for Adafruit RFM95W LoRa
-//  • No interrupt pin (polling mode)
-//  • 8 target devices (0–7)
-//  • Commands: DISCOVER, SYNC, FLASH, START:<pattern>, VOLUME:<n>
-//  • Each transmission waits for ACK or retries up to 5×
-//  • Configured for 200 m+ reliable range
+//  • DIO0 interrupt on pin 2 (RX/TX done)
+//  • Hardware reset on pin 9
+//  • Commands:
+//       DISCOVER → Ping each device (expects ACK)
+//       START:<pattern> → Send timed multi-device schedule (expects ACK)
+//       FLASH → Broadcast flash command (no ACK wait)
+//  • Each reliable command retries up to 3×
+//  • Configured for 200 m+ reliable range at SF7 (fast & robust)
 // ───────────────────────────────────────────────────────────────
 
 #include <SPI.h>
 #include <RH_RF95.h>
-#include "Packets.h"   // your shared struct definitions
+#include "Packets.h"     // Shared packet definitions
 
 // ─────────── Pin assignments ───────────
-#define RFM95_CS    10
-#define RFM95_RST   9
-#define RF95_FREQ   915.0  // NZ/AU ISM band
+#define RFM95_CS   10
+#define RFM95_RST  9
+#define RFM95_INT  2
+#define RF95_FREQ  915.0   // NZ/AU ISM band
 
-// No DIO0 interrupt pin (polling mode)
-RH_RF95 rf95(RFM95_CS);
+// ─────────── Radio setup ───────────
+RH_RF95 rf95(RFM95_CS, RFM95_INT);
+static const uint8_t  RETRY_COUNT    = 3;
+static const uint16_t ACK_TIMEOUT_MS = 300;
+static const uint8_t  NUM_SLAVES     = 8;
 
-// ─────────── Radio tuning ───────────
-static const int NUM_SLAVES = 8;
-static const uint8_t RETRY_COUNT = 5;
-static const uint16_t ACK_TIMEOUT_MS = 150;
+uint16_t seqId         = 1;
+unsigned long startDelaySec = 2;   // Delay between TX command and start time
 
-unsigned long startDelaySec = 2;
-uint8_t deviceVolume = 20;
-uint16_t seqId = 1;
-uint8_t flashSeq = 0;
-
-// ─────────── Message wrapper ───────────
-struct LoraMsg {
-  uint8_t targetId;
-  uint8_t type;
-  uint16_t seq;
-  char payload[48];
-};
-
-// ─────────── Utility prototypes ───────────
+// ─────────── Function prototypes ───────────
 bool sendReliable(uint8_t targetId, const void* data, size_t len);
-bool waitForAck(uint8_t expectTarget, uint16_t expectSeq);
-void checkSlave(int idx);
-void sendSync(int idx);
-void sendFlash(int idx);
-void handleMultiStartBinary(const char* input);
+bool sendDiscover(uint8_t targetId);
+void sendFlashBroadcast();
+void handleStartCommand(const char* input);
 
 // ─────────── Setup ───────────
 void setup() {
   Serial.begin(115200);
   delay(100);
 
-  // Manual reset pulse
   pinMode(RFM95_RST, OUTPUT);
   digitalWrite(RFM95_RST, HIGH);
   delay(10);
@@ -59,20 +48,27 @@ void setup() {
   digitalWrite(RFM95_RST, HIGH);
   delay(10);
 
+  pinMode(RFM95_INT, INPUT);
+
   if (!rf95.init()) {
     Serial.println("RFM95 init failed – check wiring!");
     while (1);
   }
 
-  // Long-range, high-reliability config
+  // SF7 for shorter airtime, 200 m+ range in open field
   rf95.setFrequency(RF95_FREQ);
-  rf95.setTxPower(20, false);         // max TX power
-  rf95.setSpreadingFactor(12);        // SF12 = longest range
-  rf95.setSignalBandwidth(125000);    // 125 kHz
-  rf95.setCodingRate4(8);             // 4/8 FEC
+  rf95.setTxPower(20, false);
+  rf95.setSpreadingFactor(7);
+  rf95.setSignalBandwidth(125000);
+  rf95.setCodingRate4(8);
   rf95.setPreambleLength(8);
 
-  Serial.println("RFM95 Reliable TX (polling mode) ready!");
+  Serial.println("RFM95 Transmitter Ready!");
+  Serial.println("Commands:");
+  Serial.println("  DISCOVER              - Ping each device and expect ACKs");
+  Serial.println("  FLASH                 - Broadcast flash command (no ACK)");
+  Serial.println("  START:00{1,2,3}@20;01{1.5,2.5,3.5}@15 - Multi-device start");
+  Serial.println();
 }
 
 // ─────────── Main loop ───────────
@@ -83,102 +79,93 @@ void loop() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\r') continue;
-
     if (c == '\n' || idx >= sizeof(buf) - 1) {
       buf[idx] = '\0';
       idx = 0;
 
       if (strcasecmp(buf, "DISCOVER") == 0) {
-        for (int i = 0; i < NUM_SLAVES; i++) { checkSlave(i); delay(50); }
-
-      } else if (strcasecmp(buf, "SYNC") == 0) {
-        for (int i = 0; i < NUM_SLAVES; i++) { sendSync(i); delay(50); }
+        Serial.println("Running DISCOVER...");
+        for (uint8_t i = 0; i < NUM_SLAVES; i++) {
+          sendDiscover(i);
+          delay(100);
+        }
 
       } else if (strcasecmp(buf, "FLASH") == 0) {
-        for (int i = 0; i < NUM_SLAVES; i++) { sendFlash(i); delay(50); }
+        sendFlashBroadcast();
 
       } else if (strncasecmp(buf, "START:", 6) == 0) {
-        handleMultiStartBinary(buf + 6);
-
-      } else if (strncasecmp(buf, "VOLUME:", 7) == 0) {
-        int v = atoi(buf + 7);
-        if (v < 0) v = 0; if (v > 30) v = 30;
-        deviceVolume = (uint8_t)v;
-        Serial.print("Default volume set to "); Serial.println(deviceVolume);
+        handleStartCommand(buf + 6);
       }
+
     } else {
       buf[idx++] = c;
     }
   }
 }
 
-// ─────────── Reliable send + ACK wait ───────────
+// ─────────── Reliable ACK send base ───────────
 bool sendReliable(uint8_t targetId, const void* data, size_t len) {
-  for (int attempt = 1; attempt <= RETRY_COUNT; ++attempt) {
+  for (uint8_t attempt = 1; attempt <= RETRY_COUNT; ++attempt) {
     rf95.send((uint8_t*)data, len);
     rf95.waitPacketSent();
 
     unsigned long start = millis();
     while (millis() - start < ACK_TIMEOUT_MS) {
       if (rf95.available()) {
-        LoraMsg ack{};
+        ReadyAckV1 ack{};
         uint8_t rlen = sizeof(ack);
         if (rf95.recv((uint8_t*)&ack, &rlen)) {
-          if (ack.targetId == targetId &&
-              strcmp(ack.payload, "ACK") == 0)
-          {
-            Serial.print("ACK from "); Serial.print(targetId);
-            Serial.print(" seq "); Serial.println(((LoraMsg*)data)->seq);
+          if (ack.type == MSG_READY_V1 && ack.seq == ((StartPacketV1*)data)->seq) {
+            Serial.print("ACK from DEV");
+            if (targetId < 10) Serial.print('0');
+            Serial.println(targetId);
             return true;
           }
         }
       }
     }
     Serial.print("Retry "); Serial.print(attempt);
-    Serial.print(" → Device "); Serial.println(targetId);
+    Serial.print(" → DEV"); if (targetId < 10) Serial.print('0'); Serial.println(targetId);
   }
-
-  Serial.print("FAIL "); Serial.println(targetId);
+  Serial.print("FAIL → DEV"); if (targetId < 10) Serial.print('0'); Serial.println(targetId);
   return false;
 }
 
-// ─────────── CHECK command ───────────
-void checkSlave(int idx) {
-  LoraMsg pkt{};
-  pkt.targetId = idx;
-  pkt.seq = seqId++;
-  strcpy(pkt.payload, "CHECK");
-  sendReliable(idx, &pkt, sizeof(pkt));
+// ─────────── Discover (1-to-1 reliable) ───────────
+bool sendDiscover(uint8_t targetId) {
+  DiscoverPacketV1 pkt{};
+  pkt.type     = MSG_DISCOVER_V1;
+  pkt.seq      = seqId++;
+  pkt.targetId = targetId;
+
+  Serial.print("Pinging DEV");
+  if (targetId < 10) Serial.print('0');
+  Serial.println(targetId);
+
+  return sendReliable(targetId, &pkt, sizeof(pkt));
 }
 
-// ─────────── SYNC command ───────────
-void sendSync(int idx) {
-  LoraMsg pkt{};
-  pkt.targetId = idx;
-  pkt.seq = seqId++;
-  snprintf(pkt.payload, sizeof(pkt.payload), "SYNC:%lu", micros());
-  sendReliable(idx, &pkt, sizeof(pkt));
+// ─────────── FLASH broadcast (no ACK) ───────────
+void sendFlashBroadcast() {
+  BroadcastPacketV1 pkt{};
+  pkt.type    = MSG_BROADCAST_V1;
+  pkt.seq     = seqId++;
+  pkt.command = CMD_FLASH;
+
+  rf95.send((uint8_t*)&pkt, sizeof(pkt));
+  rf95.waitPacketSent();
+
+  Serial.println("FLASH broadcast sent to all devices.");
 }
 
-// ─────────── FLASH command ───────────
-void sendFlash(int idx) {
-  LoraMsg pkt{};
-  pkt.targetId = idx;
-  pkt.seq = seqId++;
-  snprintf(pkt.payload, sizeof(pkt.payload), "FLASH:%u", (unsigned)flashSeq++);
-  sendReliable(idx, &pkt, sizeof(pkt));
-}
-
-// ─────────── START command (binary multi-device) ───────────
-void handleMultiStartBinary(const char* input) {
+// ─────────── START command (multi-device) ───────────
+void handleStartCommand(const char* input) {
   unsigned long masterStartTime = micros() + startDelaySec * 1000000UL;
   Serial.print("Master Start Time: "); Serial.println(masterStartTime);
 
   char buf[160];
   strncpy(buf, input, sizeof(buf));
-  buf[sizeof(buf)-1] = '\0';
-
-  unsigned long earliestGreenTime = 0xFFFFFFFFUL;
+  buf[sizeof(buf) - 1] = '\0';
 
   char* saveptr1;
   char* entry = strtok_r(buf, ";", &saveptr1);
@@ -201,6 +188,7 @@ void handleMultiStartBinary(const char* input) {
       continue;
     }
 
+    // Parse times
     char rawSteps[64];
     int rawLen = closeBrace - openBrace - 1;
     if (rawLen < 0) rawLen = 0;
@@ -208,46 +196,45 @@ void handleMultiStartBinary(const char* input) {
     strncpy(rawSteps, openBrace + 1, rawLen);
     rawSteps[rawLen] = '\0';
 
-    double tSec[4] = {0,0,0,0};
+    double tSec[4] = {0, 0, 0, 0};
     uint8_t steps = 0;
-    {
-      char tmp[64]; strncpy(tmp, rawSteps, sizeof(tmp));
-      tmp[sizeof(tmp)-1] = '\0';
-      char* sp2; char* tok = strtok_r(tmp, ",", &sp2);
-      while (tok && steps < 4) {
-        tSec[steps++] = atof(tok);
-        tok = strtok_r(NULL, ",", &sp2);
-      }
+    char tmp[64]; strncpy(tmp, rawSteps, sizeof(tmp));
+    tmp[sizeof(tmp) - 1] = '\0';
+    char* sp2; char* tok = strtok_r(tmp, ",", &sp2);
+    while (tok && steps < 4) {
+      tSec[steps++] = atof(tok);
+      tok = strtok_r(NULL, ",", &sp2);
     }
     if (steps < 3) { Serial.println("Need at least red,orange,green"); entry = strtok_r(NULL, ";", &saveptr1); continue; }
 
-    uint8_t volForThis = deviceVolume;
+    // Parse optional volume @N
+    uint8_t volForThis = 20; // default
     char* afterBrace = closeBrace + 1;
-    while (*afterBrace==' '||*afterBrace=='\t') afterBrace++;
+    while (*afterBrace == ' ' || *afterBrace == '\t') afterBrace++;
     if (*afterBrace == '@') {
       int v = atoi(afterBrace + 1);
-      if (v < 0) v = 0; if (v > 30) v = 30;
-      volForThis = (uint8_t)v;
+      volForThis = constrain(v, 0, 30);
     }
 
+    // Build packet
     StartPacketV1 pkt{};
     pkt.type        = MSG_START_V1;
     pkt.seq         = seqId++;
+	pkt.targetId    = id; 
+    pkt.currentClock = micros();
     pkt.masterStart = masterStartTime;
     pkt.volume      = volForThis;
     pkt.steps       = steps;
-    for (uint8_t i = 0; i < steps; i++) {
-      uint16_t ds = (uint16_t)(tSec[i] * 10.0 + 0.5);
-      pkt.t_ds[i] = ds;
-    }
+    memset(pkt.t_ds, 0, sizeof(pkt.t_ds));
+    for (uint8_t i = 0; i < steps; i++)
+      pkt.t_ds[i] = (uint16_t)(tSec[i] * 10.0 + 0.5);
 
-    unsigned long gtime = masterStartTime + (unsigned long)(tSec[2] * 1000000.0);
-    if (gtime < earliestGreenTime) earliestGreenTime = gtime;
-
+    // Send reliably (with ACK wait and retries)
     sendReliable(id, &pkt, sizeof(pkt));
 
-    Serial.print("START_BIN → "); Serial.print(id);
-    Serial.print(" seq="); Serial.print(pkt.seq);
+    Serial.print("START → DEV");
+    if (id < 10) Serial.print('0');
+    Serial.print(id);
     Serial.print(" vol="); Serial.print(pkt.volume);
     Serial.print(" steps=[");
     for (uint8_t i = 0; i < steps; i++) {
@@ -259,8 +246,5 @@ void handleMultiStartBinary(const char* input) {
     entry = strtok_r(NULL, ";", &saveptr1);
   }
 
-  if (earliestGreenTime != 0xFFFFFFFFUL) {
-    while ((long)(micros() - earliestGreenTime) < 0) delay(1);
-    Serial.println("STARTTIMER");
-  }
+  Serial.println("START sequence complete.");
 }
