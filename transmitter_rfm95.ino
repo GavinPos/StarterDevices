@@ -3,7 +3,7 @@
 //  • DIO0 interrupt on pin 2 (RX/TX done)
 //  • Hardware reset on pin 9
 //  • Commands:
-//       DISCOVER → Ping each device (expects ACK)
+//       DISCOVER → Ping each device (expects ACK, quiet retries)
 //       START:<pattern> → Send timed multi-device schedule (expects ACK)
 //       FLASH → Broadcast flash command (no ACK wait)
 //  • Each reliable command retries up to 3×
@@ -30,7 +30,7 @@ uint16_t seqId         = 1;
 unsigned long startDelaySec = 2;   // Delay between TX command and start time
 
 // ─────────── Function prototypes ───────────
-bool sendReliable(uint8_t targetId, const void* data, size_t len);
+bool sendReliable(uint8_t targetId, const void* data, size_t len, bool quiet = false);
 bool sendDiscover(uint8_t targetId);
 void sendFlashBroadcast();
 void handleStartCommand(const char* input);
@@ -85,8 +85,12 @@ void loop() {
 
       if (strcasecmp(buf, "DISCOVER") == 0) {
         Serial.println("Running DISCOVER...");
-        for (uint8_t i = 0; i < NUM_SLAVES; i++) {
-          sendDiscover(i);
+        for (uint8_t i = 1; i <= NUM_SLAVES; i++) {
+          bool ok = sendDiscover(i);
+          Serial.print("DEV");
+          if (i < 10) Serial.print('0');
+          Serial.print(i);
+          Serial.println(ok ? " ✅" : " ❌");
           delay(100);
         }
 
@@ -104,7 +108,7 @@ void loop() {
 }
 
 // ─────────── Reliable ACK send base ───────────
-bool sendReliable(uint8_t targetId, const void* data, size_t len) {
+bool sendReliable(uint8_t targetId, const void* data, size_t len, bool quiet) {
   for (uint8_t attempt = 1; attempt <= RETRY_COUNT; ++attempt) {
     rf95.send((uint8_t*)data, len);
     rf95.waitPacketSent();
@@ -116,33 +120,38 @@ bool sendReliable(uint8_t targetId, const void* data, size_t len) {
         uint8_t rlen = sizeof(ack);
         if (rf95.recv((uint8_t*)&ack, &rlen)) {
           if (ack.type == MSG_READY_V1 && ack.seq == ((StartPacketV1*)data)->seq) {
-            Serial.print("ACK from DEV");
-            if (targetId < 10) Serial.print('0');
-            Serial.println(targetId);
+            if (!quiet) {
+              Serial.print("ACK from DEV");
+              if (targetId < 10) Serial.print('0');
+              Serial.println(targetId);
+            }
             return true;
           }
         }
       }
     }
-    Serial.print("Retry "); Serial.print(attempt);
-    Serial.print(" → DEV"); if (targetId < 10) Serial.print('0'); Serial.println(targetId);
+    if (!quiet) {
+      Serial.print("Retry "); Serial.print(attempt);
+      Serial.print(" → DEV");
+      if (targetId < 10) Serial.print('0');
+      Serial.println(targetId);
+    }
   }
-  Serial.print("FAIL → DEV"); if (targetId < 10) Serial.print('0'); Serial.println(targetId);
+  if (!quiet) {
+    Serial.print("FAIL → DEV");
+    if (targetId < 10) Serial.print('0');
+    Serial.println(targetId);
+  }
   return false;
 }
 
-// ─────────── Discover (1-to-1 reliable) ───────────
+// ─────────── Discover (1-to-1 reliable, quiet retries) ───────────
 bool sendDiscover(uint8_t targetId) {
   DiscoverPacketV1 pkt{};
   pkt.type     = MSG_DISCOVER_V1;
   pkt.seq      = seqId++;
   pkt.targetId = targetId;
-
-  Serial.print("Pinging DEV");
-  if (targetId < 10) Serial.print('0');
-  Serial.println(targetId);
-
-  return sendReliable(targetId, &pkt, sizeof(pkt));
+  return sendReliable(targetId, &pkt, sizeof(pkt), true);  // quiet mode on
 }
 
 // ─────────── FLASH broadcast (no ACK) ───────────
@@ -160,10 +169,7 @@ void sendFlashBroadcast() {
 
 // ─────────── START command (multi-device) ───────────
 void handleStartCommand(const char* input) {
-  unsigned long masterStartTime = micros() + startDelaySec * 1000000UL;
-  Serial.print("Master Start Time: "); Serial.println(masterStartTime);
-
-  char buf[160];
+    char buf[160];
   strncpy(buf, input, sizeof(buf));
   buf[sizeof(buf) - 1] = '\0';
 
@@ -182,7 +188,7 @@ void handleStartCommand(const char* input) {
 
     char idStr[3] = { entry[0], entry[1], '\0' };
     int id = atoi(idStr);
-    if (id < 0 || id >= NUM_SLAVES) {
+    if (id < 1 || id > NUM_SLAVES) {
       Serial.print("Invalid ID: "); Serial.println(idStr);
       entry = strtok_r(NULL, ";", &saveptr1);
       continue;
@@ -216,12 +222,16 @@ void handleStartCommand(const char* input) {
       volForThis = constrain(v, 0, 30);
     }
 
+    unsigned long currentClock = micros();
+    unsigned long masterStartTime = currentClock + startDelaySec * 1000000UL;
+    Serial.print("Master Start Time: "); Serial.println(masterStartTime);
+
     // Build packet
     StartPacketV1 pkt{};
     pkt.type        = MSG_START_V1;
     pkt.seq         = seqId++;
-	pkt.targetId    = id; 
-    pkt.currentClock = micros();
+    pkt.targetId    = id;
+    pkt.currentClock = currentClock;
     pkt.masterStart = masterStartTime;
     pkt.volume      = volForThis;
     pkt.steps       = steps;

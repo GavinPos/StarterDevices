@@ -107,7 +107,8 @@ void handleStart(const StartPacketV1& pkt) {
   for (uint8_t i=0; i<pkt.steps && i<3; i++){
     unsigned long stepTime = base + (unsigned long)pkt.t_ds[i]*100000UL;
     unsigned long playTime = stepTime - (unsigned long)LEAD_T_MS[i]*1000UL;
-    if ((long)(playTime - base) < 0) playTime = base;
+
+    //if ((long)(playTime - base) < 0) playTime = base;
     addAction(playTime, ACT_PLAY, TRACK_FOR_STEP[i]);
     addAction(stepTime, (i==0)?ACT_LED_RED:(i==1)?ACT_LED_ORANGE:ACT_LED_GREEN);
   }
@@ -123,12 +124,9 @@ void handleStart(const StartPacketV1& pkt) {
 void handleBroadcast(const BroadcastPacketV1& pkt) {
   if (pkt.command == CMD_FLASH) {
     for (int i=0;i<3;i++){
-      digitalWrite(LED_GREEN,HIGH); delay(200);
-      digitalWrite(LED_GREEN,LOW);  delay(200);
-      digitalWrite(LED_ORANGE,HIGH); delay(200);
-      digitalWrite(LED_ORANGE,LOW);  delay(200);
-      digitalWrite(LED_RED,HIGH); delay(200);
-      digitalWrite(LED_RED,LOW);  delay(200);
+      digitalWrite(LED_GREEN,HIGH); delay(200);  digitalWrite(LED_GREEN,LOW);  delay(200);
+      digitalWrite(LED_ORANGE,HIGH); delay(200); digitalWrite(LED_ORANGE,LOW);  delay(200);
+      digitalWrite(LED_RED,HIGH); delay(200);    digitalWrite(LED_RED,LOW);  delay(200);
     }
   }
 }
@@ -161,6 +159,17 @@ void setup() {
   rf95.setSignalBandwidth(125000);
   rf95.setCodingRate4(8);
   rf95.setPreambleLength(8);
+
+  // Play Sounds
+  dfplayer.stop(); 
+  dfplayer.playMp3Folder(TRACK_START);
+
+  // Flash all lights once, then flash green LED at startup
+  digitalWrite(LED_RED, HIGH);
+  digitalWrite(LED_ORANGE, HIGH);
+  digitalWrite(LED_GREEN, HIGH);
+  delay(500);
+  allLedsOff();
 }
 
 // ─────────── Main loop ───────────
